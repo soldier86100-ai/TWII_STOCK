@@ -585,7 +585,7 @@ def make_chart(d, bt, out_path):
                                       edgecolor='#DC2626',linewidth=1))
             else:
                 ax.scatter(t["exit_date"],t["exit_price"],
-                           marker='o',s=75,color='#4ADE80',edgecolor='#16A34A',
+                           marker='o',s=75,color='#FCA5A5',edgecolor='#DC2626',
                            linewidth=1.5,zorder=6)
         else:
             ax.scatter(t["entry_date"],t["entry_price"]+off,
