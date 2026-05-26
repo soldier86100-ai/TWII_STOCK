@@ -67,16 +67,13 @@ msg["From"]    = gmail_user
 msg["To"]      = to_email
 msg["Subject"] = subject
 msg.attach(MIMEText(body, "plain", "utf-8"))
-# 附上 PPTX 附件
-pptx_filename = f"台股策略日報_{today_str}.pptx"
+# 附上 PPTX 附件（改用純英文檔名，避免 noname 亂碼問題）
+en_filename = f"TW_Strategy_Report_{today_str}.pptx"
 with open(str(output_path), "rb") as f:
     part = MIMEBase("application", "octet-stream")
     part.set_payload(f.read())
     encoders.encode_base64(part)
-    part.add_header(
-        "Content-Disposition",
-        f'attachment; filename="{pptx_filename}"'
-    )
+    part.add_header("Content-Disposition", f'attachment; filename="{en_filename}"')
     msg.attach(part)
 # 寄出
 print(f"\n📧 寄送中：{gmail_user} → {to_email}")
