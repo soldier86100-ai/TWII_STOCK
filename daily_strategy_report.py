@@ -557,7 +557,7 @@ def make_chart(d, bt, out_path):
         elif e==-1 and not in_short:
             ls_dt=dt; in_short=True; in_long=False
         elif e==0 and (in_long or in_short):
-            ax.axvspan(ls_dt,dt,color='#DCFCE7' if in_long else '#FEE2E2',
+            ax.axvspan(ls_dt,dt,color='#FEE2E2' if in_long else '#DCFCE7',
                        alpha=0.55,zorder=1,lw=0)
             in_long=False; in_short=False
     if in_long or in_short:
