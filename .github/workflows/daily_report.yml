@@ -1,0 +1,48 @@
+name: 台指策略日報自動寄信
+
+on:
+  schedule:
+    - cron: '0 0 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  generate-and-send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 🔤 Install CJK fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y fonts-noto-cjk
+          fc-cache -fv
+
+      - name: 📦 Install Python packages
+        run: |
+          pip install --upgrade pip
+          pip install yfinance python-pptx pandas numpy matplotlib requests holidays
+
+      - name: 📊 Generate report and send email
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_PASS: ${{ secrets.GMAIL_PASS }}
+          TO_EMAIL:   ${{ secrets.TO_EMAIL }}
+        run: python run_and_send.py
+
+      - name: 💾 Upload report as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 台股策略日報
+          path: reports/*.pptx
+          retention-days: 30
+          if-no-files-found: ignore
