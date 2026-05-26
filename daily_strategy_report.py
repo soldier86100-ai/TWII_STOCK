@@ -38,15 +38,21 @@ except ImportError:
     YF_OK = False
     print("⚠️  yfinance 未安裝：pip install yfinance")
 
-for _f in ['Microsoft JhengHei', 'PingFang TC', 'Heiti TC',
-           'Noto Sans CJK TC', 'Noto Sans CJK JP', 'Arial Unicode MS']:
-    try:
-        matplotlib.rcParams['font.sans-serif'] = [_f] + matplotlib.rcParams['font.sans-serif']
-        break
-    except Exception:
-        pass
+import matplotlib.font_manager as fm
+# 強制載入雲端下載的 NotoSans 字型
+font_path = Path("NotoSans.otf")
+if font_path.exists():
+    prop = fm.FontProperties(fname=str(font_path))
+    fm.fontManager.addfont(str(font_path))
+    matplotlib.rcParams['font.sans-serif'] = [prop.get_name()] + matplotlib.rcParams['font.sans-serif']
+else:
+    for _f in ['Microsoft JhengHei', 'PingFang TC', 'Heiti TC', 'Noto Sans CJK TC']:
+        try:
+            matplotlib.rcParams['font.sans-serif'] = [_f] + matplotlib.rcParams['font.sans-serif']
+            break
+        except Exception:
+            pass
 matplotlib.rcParams['axes.unicode_minus'] = False
-
 
 # ═══════════════════════════════════════════════════════════════
 # Config
