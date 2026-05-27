@@ -770,7 +770,8 @@ def generate_daily_report():
     print(f"\n{'='*60}")
     print(f"  ✅  日報已產出：{output_path}")
     print(f"{'='*60}")
-    return output_path
+    # ★ 回傳 (檔案路徑, 策略狀態)，供 run_and_send.py 組 Email 內文
+    return output_path, state
 
 
 if __name__=="__main__" or "ipykernel" in sys.modules:
