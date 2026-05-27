@@ -1,25 +1,24 @@
 """
-台指策略日報自動生成 v2.6
+台指策略日報自動生成 v2.7
 ================================================================
-每天早上 8:30 在 Jupyter 執行：
-
-    %run daily_strategy_report.py
+每天早上 8:00 由 GitHub Actions 自動執行
 
 輸出：./reports/台股策略日報_YYYY.MM.DD.pptx
 
 安裝套件：
-    pip install yfinance python-pptx pandas numpy matplotlib requests
+    pip install yfinance python-pptx pandas numpy matplotlib requests holidays
 ================================================================
-v2.6 變更：
-  ① 資料來源：Yahoo Finance（移除 TWSE 校正）
-  ② 因子表移除四列（加權指數月線/季線、台積電月線、費半雙均）
-  ③ 因子表字體全面放大（行高 0.041→0.053，字體 11/12→13/14）
+v2.7 變更：
+  ① 時區修正：所有 datetime 統一使用台灣時間 (UTC+8)
+  ② 顏色修正：全面改為台股慣例（紅多綠空）
+  ③ 雲端字型：自動載入 NotoSans 中文字型
+  ④ Yahoo Finance end 參數加 1 天 buffer，確保抓到最新資料
 ================================================================
 """
 
 import os, sys, warnings
 warnings.filterwarnings("ignore")
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -38,21 +37,26 @@ except ImportError:
     YF_OK = False
     print("⚠️  yfinance 未安裝：pip install yfinance")
 
+# ── 台灣時區 ──────────────────────────────────────────────────
+TW_TZ = timezone(timedelta(hours=8))
+
+# ── 字型設定（雲端 + 本機都能用）────────────────────────────────
 import matplotlib.font_manager as fm
-# 強制載入雲端下載的 NotoSans 字型
 font_path = Path("NotoSans.otf")
 if font_path.exists():
     prop = fm.FontProperties(fname=str(font_path))
     fm.fontManager.addfont(str(font_path))
     matplotlib.rcParams['font.sans-serif'] = [prop.get_name()] + matplotlib.rcParams['font.sans-serif']
 else:
-    for _f in ['Microsoft JhengHei', 'PingFang TC', 'Heiti TC', 'Noto Sans CJK TC']:
+    for _f in ['Microsoft JhengHei', 'PingFang TC', 'Heiti TC',
+               'Noto Sans CJK TC', 'Noto Sans CJK JP', 'Arial Unicode MS']:
         try:
             matplotlib.rcParams['font.sans-serif'] = [_f] + matplotlib.rcParams['font.sans-serif']
             break
         except Exception:
             pass
 matplotlib.rcParams['axes.unicode_minus'] = False
+
 
 # ═══════════════════════════════════════════════════════════════
 # Config
@@ -84,8 +88,10 @@ BASE_S = {'fS1':1.5,'fS2':1.0,'fS3':2.0,'fS4':2.0,'fS5':2.0,'fS6':1.0,'fS7':0.5,
 def fetch_market_data() -> pd.DataFrame:
     """Yahoo Finance；失敗時 fallback 本地 CSV"""
     if YF_OK:
-        end   = datetime.now()
-        start = end - timedelta(days=540)
+        # ★ 使用台灣時間，並加 1 天 buffer 確保抓到最新資料
+        now_tw = datetime.now(TW_TZ).replace(tzinfo=None)
+        end    = now_tw + timedelta(days=1)
+        start  = now_tw - timedelta(days=540)
         specs = {
             "TWII"    : "^TWII",
             "SOX"     : "^SOX",
@@ -93,7 +99,7 @@ def fetch_market_data() -> pd.DataFrame:
             "TSM_US"  : "TSM",
             "ELEC"    : "0053.TW",
             "FIN"     : "0055.TW",
-            "USDTWD"  : "USDTWD=X",   # 正確方向：1 USD ≈ 31 TWD
+            "USDTWD"  : "USDTWD=X",
         }
         frames = {}
         for name, ticker in specs.items():
@@ -132,6 +138,9 @@ def fetch_market_data() -> pd.DataFrame:
             df = df.dropna(subset=["TWII"]).reset_index().rename(columns={"index":"date"})
             if "date" not in df.columns:
                 df = df.rename(columns={df.columns[0]:"date"})
+
+            # ★ 印出最新資料日期，方便除錯
+            print(f"  ✓  Yahoo 最新資料日期：{df['date'].iloc[-1].date()}")
             return df
 
     csv_path = SCRIPT_DIR / "台指量化模型基礎資料表_包含電子金融.csv"
@@ -379,7 +388,7 @@ def compute_1yr_stats(d, bt):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 4. 圖檔生成
+# 4. 圖檔生成（台股慣例：紅多綠空）
 # ═══════════════════════════════════════════════════════════════
 def make_stats_image(stats, out_path):
     rows = [
@@ -429,9 +438,6 @@ def make_stats_image(stats, out_path):
 def make_factor_image(d, out_path):
     """
     重要因子最新狀況
-    ★ v2.6：移除月線MA20/季線MA60（TWII）、費半雙均、台積電月線
-             共 4 列 → 剩 14 資料列 + 4 分組標題 = 18 列
-             行高 0.041→0.053，字體 11/12→13/14
     PPT 插入：5.30" × 7.24"  →  figsize=(5.3, 7.24)
     """
     i=len(d)-1; p=max(0,i-1)
@@ -457,13 +463,9 @@ def make_factor_image(d, out_path):
     sox_s,sox_c=(('雙均偏多','g') if sox>sox20 and sox>sox60 else
                  ('雙均偏空','r') if sox<sox20 and sox<sox60 else ('震盪','n'))
 
-    # ── 因子列表（已移除 4 列）──────────────────────────────────
     rows = [
-        # ── 加權指數（移除月線MA20、季線MA60）──
         ('GROUP','加權指數 (TAIEX)',None,None),
         ('收盤指數',   f"{twii:,.0f}",   f"{twii_chg:+.2f}%",'g' if twii_chg>0 else 'r'),
-        # 月線 MA20 → 移除
-        # 季線 MA60 → 移除
         ('季線乖離率', f"{bias:+.2f}%",
             '超賣' if bias<-8 else ('超買' if bias>8 else '常態'),
             'g' if bias<-8 else ('r' if bias>8 else 'n')),
@@ -473,22 +475,17 @@ def make_factor_image(d, out_path):
             '強多' if mom5>2 else ('強空' if mom5<-2 else '中性'),
             'g' if mom5>2 else ('r' if mom5<-2 else 'n')),
 
-        # ── 風格輪動（不變）──
         ('GROUP','風格輪動 (電金比)',None,None),
         ('電金比',   f"{ef:.4f}",   f"{ef-efp:+.4f}", 'g' if ef>efp else 'r'),
         ('vs 月線',  f"{ef20:.4f}", *sta('站上','跌破',ef>ef20)),
         ('vs 季線',  f"{ef60:.4f}", *sta('站上','跌破',ef>ef60)),
 
-        # ── 半導體（移除費半雙均、台積電月線）──
         ('GROUP','半導體 (海外+本土)',None,None),
         ('費城半導體', f"{sox:,.0f}",  f"{sox_chg:+.2f}%", 'g' if sox_chg>0 else 'r'),
-        # 費半雙均 → 移除
         ('台積電現貨', f"{tsmc:,.0f}", f"{tsmc_chg:+.2f}%",'g' if tsmc_chg>0 else 'r'),
-        # 台積電月線 → 移除
         ('台積量比',   f"{vr:.2f}x",
             '爆量' if vr>1.5 else '正常','r' if vr>1.5 else 'n'),
 
-        # ── 海外資金面（ADR 折溢價原始數值移除，保留 ADR Z-score）──
         ('GROUP','海外資金面',None,None),
         ('ADR Z-score', f"{adrz:+.2f}s",
             '搶單' if adrz>0.8 else ('撤退' if adrz<-1.0 else '中性'),
@@ -499,16 +496,14 @@ def make_factor_image(d, out_path):
             '強買超' if fiz>1.2 else ('強賣超' if fiz<-1.2 else '中性'),
             'g' if fiz>1.2 else ('r' if fiz<-1.2 else 'n')),
     ]
-    # 共 17 列（4 GROUP + 13 資料列）
 
-    cmap = {'g':'#DC2626','r':'#16A34A','n':'#64748B'}   # 台灣慣例：漲=紅 跌=綠
+    # ★ 台股慣例：g(多/漲)=紅色, r(空/跌)=綠色
+    cmap = {'g':'#DC2626','r':'#16A34A','n':'#64748B'}
 
-    # figsize=(5.3, 7.24) 對應 PPT 插入 5.30"×7.24"
     fig, ax = plt.subplots(figsize=(5.3, 7.24), facecolor='white')
     ax.set_facecolor('white'); ax.axis('off')
     ax.set_xlim(0,1); ax.set_ylim(0,1)
 
-    # 欄位標頭（字體放大）
     ax.text(0.04, 0.988, '因子',   fontsize=13, color='#64748B',
             fontweight='bold', va='top')
     ax.text(0.57, 0.988, '當前值', fontsize=13, color='#64748B',
@@ -516,9 +511,8 @@ def make_factor_image(d, out_path):
     ax.text(0.87, 0.988, '狀態',   fontsize=13, color='#64748B',
             fontweight='bold', va='top', ha='center')
 
-    # 18 列 × 行高 0.053 = 0.954，起點 0.960，底部留 0.006 空白
     y = 0.960
-    rh = 0.053   # ← 行高放大（原 0.041）
+    rh = 0.053
 
     for row in rows:
         if row[0] == 'GROUP':
@@ -557,6 +551,7 @@ def make_chart(d, bt, out_path):
         elif e==-1 and not in_short:
             ls_dt=dt; in_short=True; in_long=False
         elif e==0 and (in_long or in_short):
+            # ★ 多單背景=淺紅, 空單背景=淺綠
             ax.axvspan(ls_dt,dt,color='#FEE2E2' if in_long else '#DCFCE7',
                        alpha=0.55,zorder=1,lw=0)
             in_long=False; in_short=False
@@ -574,6 +569,7 @@ def make_chart(d, bt, out_path):
     for t in trades_1y:
         is_open="exit_date" not in t
         if t["dir_code"]==1:
+            # ★ 多單進場：紅色▲
             ax.scatter(t["entry_date"],t["entry_price"]-off,
                        marker='^',s=170,color='#DC2626',edgecolor='white',
                        linewidth=1.8,zorder=6)
@@ -584,10 +580,12 @@ def make_chart(d, bt, out_path):
                             bbox=dict(boxstyle='round,pad=0.2',facecolor='#FEE2E2',
                                       edgecolor='#DC2626',linewidth=1))
             else:
+                # ★ 多單出場：淺紅色○
                 ax.scatter(t["exit_date"],t["exit_price"],
                            marker='o',s=75,color='#FCA5A5',edgecolor='#DC2626',
                            linewidth=1.5,zorder=6)
         else:
+            # ★ 空單進場：綠色▼
             ax.scatter(t["entry_date"],t["entry_price"]+off,
                        marker='v',s=170,color='#16A34A',edgecolor='white',
                        linewidth=1.8,zorder=6)
@@ -598,6 +596,7 @@ def make_chart(d, bt, out_path):
                             bbox=dict(boxstyle='round,pad=0.2',facecolor='#DCFCE7',
                                       edgecolor='#16A34A',linewidth=1))
             else:
+                # ★ 空單出場：淺綠色○
                 ax.scatter(t["exit_date"],t["exit_price"],
                            marker='o',s=75,color='#4ADE80',edgecolor='#16A34A',
                            linewidth=1.5,zorder=6)
@@ -665,6 +664,7 @@ def generate_pptx(run_date, state, stats_img, factor_img, chart_img, output_path
                 if len(p.runs)>=7:
                     rec=state["recommendation"]; bias=state["bias"]
                     p.runs[2].text=rec+"　　　　 　　"
+                    # ★ 多=紅, 空=綠
                     if   rec in ("多單續抱","多單建倉","空單轉多"):
                         p.runs[2].font.color.rgb=RGBColor.from_string("DC2626")
                     elif rec in ("空單續抱","空單建倉","多單轉空"):
@@ -679,7 +679,6 @@ def generate_pptx(run_date, state, stats_img, factor_img, chart_img, output_path
     for _s in slide.shapes:
         if _s.name=='文字方塊 29':
             _s.top=int(11.64*_EMU); _s.height=int(4.61*_EMU); break
-    # 三張圖位置（對齊 2026-05-24 參考版本）
     slide.shapes.add_picture(stats_img,  Inches(0.00),Inches(4.40),
                              width=Inches(5.30),height=Inches(7.05))
     slide.shapes.add_picture(factor_img, Inches(5.70),Inches(4.40),
@@ -704,10 +703,11 @@ def generate_pptx(run_date, state, stats_img, factor_img, chart_img, output_path
 # 6. 主程式
 # ═══════════════════════════════════════════════════════════════
 def generate_daily_report():
-    run_date=datetime.today().date()
+    # ★ 使用台灣時間取得日期
+    run_date = datetime.now(TW_TZ).date()
     print("="*60)
-    print(f"  台指策略日報  v15 多因子量化模型  v2.6")
-    print(f"  執行日期：{run_date}  ({datetime.now().strftime('%H:%M:%S')})")
+    print(f"  台指策略日報  v15 多因子量化模型  v2.7")
+    print(f"  執行日期：{run_date}  ({datetime.now(TW_TZ).strftime('%H:%M:%S')} 台灣時間)")
     print("="*60)
 
     df=fetch_market_data()
