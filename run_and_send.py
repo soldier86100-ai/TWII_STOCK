@@ -4,7 +4,7 @@ run_and_send.py
 由 GitHub Actions 每天 08:00（台灣時間）自動執行：
   1. 判斷今天是否為交易日（週末 / 台灣國定假日 → 跳過）
   2. 執行 daily_strategy_report.py 產生 PPTX
-  3. 用 Gmail 寄信附檔到指定信箱
+  3. 用 Gmail 寄信附檔到指定信箱（信件內文包含策略建議與模型分析）
 ================================================================
 """
 
@@ -52,7 +52,7 @@ print("=" * 60)
 # ── 2. 執行日報產生 ─────────────────────────────────────────────
 try:
     from daily_strategy_report import generate_daily_report
-    output_path = generate_daily_report()
+    output_path, state = generate_daily_report()
 except Exception as e:
     print(f"❌ 日報產生失敗：{e}")
     import traceback
@@ -75,13 +75,18 @@ if not all([gmail_user, gmail_pass, to_email]):
     sys.exit(1)
 
 today_str = today.strftime("%Y.%m.%d")
-subject   = f"【台股策略日報】{today_str}"
-body      = f"""\
-您好，
 
-附件為今日台股策略日報（{today_str}），請查收。
+# ★ 從 state 取得策略建議與模型分析
+recommendation = state["recommendation"]   # 例如：多單續抱、空手觀望、空單建倉
+bias           = state["bias"]             # 例如：偏多、偏空、震盪
 
-此信由 GitHub Actions 系統自動寄出，請勿直接回覆。
+subject = f"【台股策略日報】{today_str}"
+body    = f"""\
+各位長官同仁好，
+
+今日訊號分數為「策略建議：{recommendation}，模型分析：{bias}」，附件為今日台股策略日報（{today_str}），請查收。
+
+此信由系統自動寄出，請勿直接回覆。
 """
 
 # 建立郵件
@@ -102,6 +107,7 @@ with open(str(output_path), "rb") as f:
 
 # 寄出
 print(f"\n📧 寄送中：{gmail_user} → {to_email}")
+print(f"   策略建議：{recommendation}　模型分析：{bias}")
 try:
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(gmail_user, gmail_pass)
