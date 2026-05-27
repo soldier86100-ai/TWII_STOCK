@@ -2,7 +2,11 @@ name: 台指策略日報自動寄信
 
 on:
   schedule:
-    - cron: '0 0 * * 1-5'
+    # 台灣時間 07:30 = UTC 前一天 23:30
+    # UTC 週日~四 23:30 = 台灣週一~五 07:30
+    - cron: '30 23 * * 0-4'
+
+  # 保留手動觸發按鈕（可在 GitHub Actions 頁面測試）
   workflow_dispatch:
 
 jobs:
@@ -11,24 +15,38 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # ── 1. 下載儲存庫程式碼 ──────────────────────────────────
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
 
+      # ── 2. 設定 Python 環境 ──────────────────────────────────
       - name: 🐍 Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-         
-           # ── 3. 準備中文字型 ──────────────────────────────────────
-      - name: 🔤 Prepare Chinese Font
-        run: |
-          wget https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/TraditionalChinese/NotoSansCJKtc-Regular.otf -O NotoSans.otf
 
+      # ── 3. 安裝中文字型（matplotlib 中文顯示用）─────────────
+      - name: 🔤 Install CJK fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y fonts-noto-cjk
+          fc-cache -fv
+          echo "✅ 中文字型安裝完成"
+
+      # ── 4. 安裝 Python 套件 ──────────────────────────────────
       - name: 📦 Install Python packages
         run: |
           pip install --upgrade pip
-          pip install yfinance python-pptx pandas numpy matplotlib requests holidays
+          pip install \
+            yfinance \
+            python-pptx \
+            pandas \
+            numpy \
+            matplotlib \
+            requests \
+            holidays
 
+      # ── 5. 執行日報產生 + 自動寄信 ──────────────────────────
       - name: 📊 Generate report and send email
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
@@ -36,6 +54,7 @@ jobs:
           TO_EMAIL:   ${{ secrets.TO_EMAIL }}
         run: python run_and_send.py
 
+      # ── 6. 上傳 PPTX 作為 Artifact（備份，可選）────────────
       - name: 💾 Upload report as artifact
         if: always()
         uses: actions/upload-artifact@v4
