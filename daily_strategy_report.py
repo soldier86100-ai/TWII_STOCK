@@ -800,3 +800,4 @@ def generate_daily_report():
 
 if __name__=="__main__" or "ipykernel" in sys.modules:
     generate_daily_report()
+    
