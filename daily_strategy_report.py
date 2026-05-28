@@ -41,8 +41,19 @@ except ImportError:
 TW_TZ = timezone(timedelta(hours=8))
 
 # ── 字型設定（雲端 + 本機都能用）────────────────────────────────
+import urllib.request
 import matplotlib.font_manager as fm
+
 font_path = Path("NotoSans.otf")
+# 若字型檔不存在，自動從 Google Fonts 下載
+if not font_path.exists():
+    try:
+        print("  正在下載中文字型 (NotoSans)...")
+        font_url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/TraditionalChinese/NotoSansCJKtc-Regular.otf"
+        urllib.request.urlretrieve(font_url, str(font_path))
+    except Exception as e:
+        print(f"  ⚠️ 字型下載失敗: {e}")
+
 if font_path.exists():
     prop = fm.FontProperties(fname=str(font_path))
     fm.fontManager.addfont(str(font_path))
@@ -88,10 +99,7 @@ BASE_S = {'fS1':1.5,'fS2':1.0,'fS3':2.0,'fS4':2.0,'fS5':2.0,'fS6':1.0,'fS7':0.5,
 def fetch_market_data() -> pd.DataFrame:
     """Yahoo Finance；失敗時 fallback 本地 CSV"""
     if YF_OK:
-        # ★ 使用台灣時間，並加 1 天 buffer 確保抓到最新資料
         now_tw = datetime.now(TW_TZ).replace(tzinfo=None)
-        end    = now_tw + timedelta(days=1)
-        start  = now_tw - timedelta(days=540)
         specs = {
             "TWII"    : "^TWII",
             "SOX"     : "^SOX",
@@ -104,7 +112,8 @@ def fetch_market_data() -> pd.DataFrame:
         frames = {}
         for name, ticker in specs.items():
             try:
-                raw = yf.Ticker(ticker).history(start=start, end=end)
+                # ★ 改用 period="24mo" 取代 start/end，這能避免 YF 時區 bug 導致漏抓最新日期
+                raw = yf.Ticker(ticker).history(period="24mo")
                 if raw.empty: continue
                 if raw.index.tz is not None:
                     raw.index = raw.index.tz_localize(None)
@@ -114,11 +123,23 @@ def fetch_market_data() -> pd.DataFrame:
                     frames["TSMC_Vol"] = raw[["Volume"]].rename(columns={"Volume":"TSMC_Vol"})
                 if name == "TWII":
                     frames["TWII_Open"] = raw[["Open"]].rename(columns={"Open":"TWII_Open"})
+                    frames["TWII_High"] = raw[["High"]].rename(columns={"High":"TWII_High"})
+                    frames["TWII_Low"]  = raw[["Low"]].rename(columns={"Low":"TWII_Low"})
             except Exception as e:
                 print(f"  ⚠️  {ticker}: {e}")
 
         if frames and "TWII" in frames:
-            df = pd.concat(frames.values(), axis=1).sort_index().ffill()
+            df = pd.concat(frames.values(), axis=1).sort_index()
+
+            # ★ 剔除 YF 產生的假 K 棒（當日未開盤前，YF 會生出一根開高低收完全相等的 K 棒）
+            if all(c in df.columns for c in ["TWII", "TWII_Open", "TWII_High", "TWII_Low"]):
+                fake_mask = (df["TWII"] == df["TWII_Open"]) & (df["TWII_High"] == df["TWII_Low"]) & (df["TWII"] == df["TWII_High"])
+                df = df[~fake_mask]
+
+            # ★ 關鍵修正：必須先剔除 TWII 沒有資料的日子，再 ffill()。
+            # 否則如果昨天台股沒資料(或放假)而美股有開，會把「前天」的台股收盤價錯誤複製到「昨天」！
+            df = df.dropna(subset=["TWII"])
+            df = df.ffill()
 
             # USDTWD 合理性驗證（應介於 15~50 TWD/USD）
             if "USDTWD" in df.columns:
@@ -135,11 +156,14 @@ def fetch_market_data() -> pd.DataFrame:
             else:
                 df["ADR_Premium"] = np.nan
 
-            df = df.dropna(subset=["TWII"]).reset_index().rename(columns={"index":"date"})
+            df = df.reset_index().rename(columns={"index":"date"})
             if "date" not in df.columns:
                 df = df.rename(columns={df.columns[0]:"date"})
 
-            # ★ 印出最新資料日期，方便除錯
+            # ★ 避免 Yahoo Finance 偷跑：早上盤前執行時，若撈到今天的假 K 棒必須剔除
+            if now_tw.hour < 14:
+                df = df[df["date"].dt.date < now_tw.date()].reset_index(drop=True)
+
             print(f"  ✓  Yahoo 最新資料日期：{df['date'].iloc[-1].date()}")
             return df
 
