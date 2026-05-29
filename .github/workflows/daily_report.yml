@@ -1,13 +1,15 @@
 name: 台指策略日報自動寄信
 
 on:
+  # ── 主要觸發：由 cron-job.org 在台灣時間 07:30 精準呼叫 GitHub API ──
+  repository_dispatch:
+    types: [trigger-daily-report]
+
+  # ── 備援觸發：萬一外部排程失效，UTC 22:13（台灣 06:13）仍會自動執行 ──
   schedule:
-    # 台灣時間 06:13 = UTC 前一天 22:13
-    # 避開 00 或 30 分的尖峰時段，並提早排程以緩解 GitHub Actions 延遲問題
-    # UTC 週日~四 22:13 = 台灣週一~五 06:13
     - cron: '13 22 * * 0-4'
 
-  # 保留手動觸發按鈕（可在 GitHub Actions 頁面測試）
+  # ── 手動觸發按鈕（可在 GitHub Actions 頁面測試）──
   workflow_dispatch:
 
 jobs:
