@@ -110,48 +110,84 @@ def fetch_market_data() -> pd.DataFrame:
             "USDTWD"  : "USDTWD=X",
         }
         frames = {}
-        for name, ticker in specs.items():
-            try:
-                # ★ 改用 period="24mo" 取代 start/end，這能避免 YF 時區 bug 導致漏抓最新日期
-                raw = yf.Ticker(ticker).history(period="24mo")
-                if raw.empty: continue
-                if raw.index.tz is not None:
-                    raw.index = raw.index.tz_localize(None)
-                raw.index = pd.to_datetime(raw.index).normalize()
-                frames[name] = raw[["Close"]].rename(columns={"Close": name})
-                if name == "TSMC_TW":
-                    frames["TSMC_Vol"] = raw[["Volume"]].rename(columns={"Volume":"TSMC_Vol"})
-                if name == "TWII":
-                    frames["TWII_Open"] = raw[["Open"]].rename(columns={"Open":"TWII_Open"})
-                    frames["TWII_High"] = raw[["High"]].rename(columns={"High":"TWII_High"})
-                    frames["TWII_Low"]  = raw[["Low"]].rename(columns={"Low":"TWII_Low"})
-            except Exception as e:
-                print(f"  ⚠️  {ticker}: {e}")
 
-        # ★ 新增：YF 的 ^TWII 經常延遲一天，且 GitHub Actions 伺服器在海外會被 TWSE 擋 IP。
-        # 這裡改呼叫 FinMind 官方 API 取得最新加權指數來補強！
-        if "TWII" in frames:
-            try:
-                start_str = (now_tw - timedelta(days=10)).strftime("%Y-%m-%d")
-                url = "https://api.finmindtrade.com/api/v4/data"
-                params = {"dataset":"TaiwanStockPrice", "data_id":"TAIEX", "start_date":start_str, "token":FINMIND_TOKEN}
-                res = requests.get(url, params=params, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
-                data = res.json()
-                if data.get("msg") == "success" and data.get("data"):
-                    fm_df = pd.DataFrame(data["data"])
-                    fm_df["date"] = pd.to_datetime(fm_df["date"]).dt.normalize()
-                    fm_df = fm_df.set_index("date")
+        # ★ 改用 yf.download() 批次下載，比逐一 Ticker.history() 穩定許多
+        ticker_list = list(specs.values())
+        ticker_names = list(specs.keys())
+        try:
+            import time
+            print(f"  正在從 Yahoo Finance 下載資料...")
+            raw_all = yf.download(
+                tickers=ticker_list,
+                period="24mo",
+                auto_adjust=True,
+                progress=False,
+                group_by="ticker",
+            )
+            if raw_all.empty:
+                time.sleep(3)
+                raw_all = yf.download(
+                    tickers=ticker_list, period="24mo",
+                    auto_adjust=True, progress=False, group_by="ticker"
+                )
+        except Exception as e:
+            print(f"  ⚠️  yf.download 失敗: {e}")
+            raw_all = pd.DataFrame()
+
+        if not raw_all.empty:
+            for name, ticker in specs.items():
+                try:
+                    if len(ticker_list) == 1:
+                        tk_df = raw_all
+                    else:
+                        tk_df = raw_all[ticker] if ticker in raw_all.columns.get_level_values(0) else pd.DataFrame()
+                    if tk_df.empty: continue
+                    if tk_df.index.tz is not None:
+                        tk_df.index = tk_df.index.tz_localize(None)
+                    tk_df.index = pd.to_datetime(tk_df.index).normalize()
+                    frames[name] = tk_df[["Close"]].rename(columns={"Close": name})
+                    if name == "TSMC_TW" and "Volume" in tk_df.columns:
+                        frames["TSMC_Vol"] = tk_df[["Volume"]].rename(columns={"Volume":"TSMC_Vol"})
+                    if name == "TWII":
+                        if "Open"   in tk_df.columns: frames["TWII_Open"] = tk_df[["Open"]].rename(columns={"Open":"TWII_Open"})
+                        if "High"   in tk_df.columns: frames["TWII_High"] = tk_df[["High"]].rename(columns={"High":"TWII_High"})
+                        if "Low"    in tk_df.columns: frames["TWII_Low"]  = tk_df[["Low"]].rename(columns={"Low":"TWII_Low"})
+                except Exception as e:
+                    print(f"  ⚠️  解析 {ticker}: {e}")
+
+        # ★ 新增：YF 的 ^TWII 經常延遲一天或完全抓不到。
+        # 這裡改呼叫 FinMind 官方 API 取得最新加權指數來補強，甚至在 YF 失敗時直接取代！
+        try:
+            start_str = (now_tw - timedelta(days=20)).strftime("%Y-%m-%d")
+            url = "https://api.finmindtrade.com/api/v4/data"
+            params = {"dataset":"TaiwanStockPrice", "data_id":"TAIEX", "start_date":start_str, "token":FINMIND_TOKEN}
+            res = requests.get(url, params=params, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
+            data = res.json()
+            if data.get("msg") == "success" and data.get("data"):
+                fm_df = pd.DataFrame(data["data"])
+                fm_df["date"] = pd.to_datetime(fm_df["date"]).dt.normalize()
+                fm_df = fm_df.set_index("date")
+                
+                # 若 YF 完全沒抓到，就用 FinMind 建立骨架
+                if "TWII" not in frames: frames["TWII"] = pd.DataFrame(columns=["TWII"])
+                if "TWII_Open" not in frames: frames["TWII_Open"] = pd.DataFrame(columns=["TWII_Open"])
+                if "TWII_High" not in frames: frames["TWII_High"] = pd.DataFrame(columns=["TWII_High"])
+                if "TWII_Low"  not in frames: frames["TWII_Low"]  = pd.DataFrame(columns=["TWII_Low"])
+                
+                for dt, row in fm_df.iterrows():
+                    # FinMind 資料絕對準確，直接覆蓋 YF 的假資料或填補空缺
+                    frames["TWII"].loc[dt, "TWII"] = float(row["close"])
+                    frames["TWII_Open"].loc[dt, "TWII_Open"] = float(row["open"])
+                    frames["TWII_High"].loc[dt, "TWII_High"] = float(row["max"])
+                    frames["TWII_Low"].loc[dt, "TWII_Low"]  = float(row["min"])
                     
-                    for dt, row in fm_df.iterrows():
-                        # FinMind 資料絕對準確，直接覆蓋 YF 的假資料或填補空缺
-                        frames["TWII"].loc[dt, "TWII"] = float(row["close"])
-                        frames["TWII"].loc[dt, "TWII_Open"] = float(row["open"])
-                        frames["TWII"].loc[dt, "TWII_High"] = float(row["max"])
-                        frames["TWII"].loc[dt, "TWII_Low"]  = float(row["min"])
-                        
-                    print(f"  ✓  FinMind 最新加權指數補強成功：{fm_df.index[-1].date()} -> {fm_df.iloc[-1]['close']:,.0f}")
-            except Exception as e:
-                print(f"  ⚠️  FinMind 補強失敗: {e}")
+                print(f"  ✓  FinMind 最新加權指數補強成功：{fm_df.index[-1].date()} -> {fm_df.iloc[-1]['close']:,.0f}")
+        except Exception as e:
+            print(f"  ⚠️  FinMind 補強失敗: {e}")
+
+        # 合併前先去除任何可能的重複日期（YF 常見 bug 會導致 concat 崩潰）
+        for name in list(frames.keys()):
+            frames[name] = frames[name][~frames[name].index.duplicated(keep='last')]
 
         if frames and "TWII" in frames:
             df = pd.concat(frames.values(), axis=1).sort_index()
@@ -190,13 +226,19 @@ def fetch_market_data() -> pd.DataFrame:
                 df = df[df["date"].dt.date < now_tw.date()].reset_index(drop=True)
 
             print(f"  ✓  Yahoo 最新資料日期：{df['date'].iloc[-1].date()}")
-            return df
+            print(f"  ✓  最終資料日期：{df['date'].iloc[-1].date()}")
+            # 只要有 TWII 就可以繼續（其他欄位缺失時模型會自動降級）
+            if "TWII" in df.columns:
+                missing = [c for c in ["SOX","TSMC_TW","ELEC"] if c not in df.columns]
+                if missing:
+                    print(f"  ⚠️  部分欄位缺失（可能 YF 流量限制）: {missing}，計算時將忽略")
+                return df
 
     csv_path = SCRIPT_DIR / "台指量化模型基礎資料表_包含電子金融.csv"
     if csv_path.exists():
         print(f"  ⚠️  Yahoo 失敗，改用 CSV: {csv_path.name}")
         return _load_from_csv(csv_path)
-    raise RuntimeError("無法取得市場資料")
+    raise RuntimeError("無法取得市場資料，可能是 Yahoo Finance 流量限制 (429)，請等待 30 分鐘後再試。")
 
 
 def _load_from_csv(path) -> pd.DataFrame:
@@ -825,4 +867,3 @@ def generate_daily_report():
 
 if __name__=="__main__" or "ipykernel" in sys.modules:
     generate_daily_report()
-    
