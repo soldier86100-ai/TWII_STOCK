@@ -128,6 +128,31 @@ def fetch_market_data() -> pd.DataFrame:
             except Exception as e:
                 print(f"  ⚠️  {ticker}: {e}")
 
+        # ★ 新增：YF 的 ^TWII 經常延遲一天，且 GitHub Actions 伺服器在海外會被 TWSE 擋 IP。
+        # 這裡改呼叫 FinMind 官方 API 取得最新加權指數來補強！
+        if "TWII" in frames:
+            try:
+                start_str = (now_tw - timedelta(days=10)).strftime("%Y-%m-%d")
+                url = "https://api.finmindtrade.com/api/v4/data"
+                params = {"dataset":"TaiwanStockPrice", "data_id":"TAIEX", "start_date":start_str, "token":FINMIND_TOKEN}
+                res = requests.get(url, params=params, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
+                data = res.json()
+                if data.get("msg") == "success" and data.get("data"):
+                    fm_df = pd.DataFrame(data["data"])
+                    fm_df["date"] = pd.to_datetime(fm_df["date"]).dt.normalize()
+                    fm_df = fm_df.set_index("date")
+                    
+                    for dt, row in fm_df.iterrows():
+                        # FinMind 資料絕對準確，直接覆蓋 YF 的假資料或填補空缺
+                        frames["TWII"].loc[dt, "TWII"] = float(row["close"])
+                        frames["TWII"].loc[dt, "TWII_Open"] = float(row["open"])
+                        frames["TWII"].loc[dt, "TWII_High"] = float(row["max"])
+                        frames["TWII"].loc[dt, "TWII_Low"]  = float(row["min"])
+                        
+                    print(f"  ✓  FinMind 最新加權指數補強成功：{fm_df.index[-1].date()} -> {fm_df.iloc[-1]['close']:,.0f}")
+            except Exception as e:
+                print(f"  ⚠️  FinMind 補強失敗: {e}")
+
         if frames and "TWII" in frames:
             df = pd.concat(frames.values(), axis=1).sort_index()
 
@@ -800,4 +825,3 @@ def generate_daily_report():
 
 if __name__=="__main__" or "ipykernel" in sys.modules:
     generate_daily_report()
-    
