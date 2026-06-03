@@ -5,10 +5,6 @@ on:
   repository_dispatch:
     types: [trigger-daily-report]
 
-  # ── 備援觸發：萬一外部排程失效，UTC 22:13（台灣 06:13）仍會自動執行 ──
-  schedule:
-    - cron: '13 22 * * 0-4'
-
   # ── 手動觸發按鈕（可在 GitHub Actions 頁面測試）──
   workflow_dispatch:
 
