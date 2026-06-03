@@ -74,6 +74,10 @@ if not all([gmail_user, gmail_pass, to_email]):
     print("❌ 環境變數 GMAIL_USER / GMAIL_PASS / TO_EMAIL 未設定")
     sys.exit(1)
 
+# ★ 支援多位收件人：TO_EMAIL 用逗號分隔即可，例如：a@gmail.com,b@gmail.com,c@gmail.com
+to_list = [addr.strip() for addr in to_email.split(",") if addr.strip()]
+print(f"   收件人共 {len(to_list)} 位：{', '.join(to_list)}")
+
 today_str = today.strftime("%Y.%m.%d")
 
 # ★ 從 state 取得策略建議與模型分析
@@ -92,7 +96,7 @@ body    = f"""\
 # 建立郵件
 msg = MIMEMultipart()
 msg["From"]    = gmail_user
-msg["To"]      = to_email
+msg["To"]      = ", ".join(to_list)   # ★ 多位收件人顯示在信件標頭（逗號分隔）
 msg["Subject"] = subject
 msg.attach(MIMEText(body, "plain", "utf-8"))
 
@@ -106,13 +110,13 @@ with open(str(output_path), "rb") as f:
     msg.attach(part)
 
 # 寄出
-print(f"\n📧 寄送中：{gmail_user} → {to_email}")
+print(f"\n📧 寄送中：{gmail_user} → {', '.join(to_list)}")
 print(f"   策略建議：{recommendation}　模型分析：{bias}")
 try:
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(gmail_user, gmail_pass)
-        server.sendmail(gmail_user, to_email, msg.as_string())
-    print(f"✅ 日報已成功寄出至 {to_email}")
+        server.sendmail(gmail_user, to_list, msg.as_string())  # ★ 傳入清單，一次寄給所有收件人
+    print(f"✅ 日報已成功寄出至 {len(to_list)} 位收件人")
 except smtplib.SMTPAuthenticationError:
     print("❌ Gmail 驗證失敗，請確認應用程式密碼是否正確")
     sys.exit(1)
