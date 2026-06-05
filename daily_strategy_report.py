@@ -791,8 +791,141 @@ def generate_pptx(run_date, state, stats_img, factor_img, chart_img, output_path
 
 
 # ═══════════════════════════════════════════════════════════════
-# 6. 主程式
+# 5-B. Excel 進出場明細產生
 # ═══════════════════════════════════════════════════════════════
+def export_trades_excel(d, bt, run_date, output_dir) -> Path:
+    """
+    將近一年的進出場明細輸出為 Excel 檔案。
+    欄位：方向、進場日期、進場點位、出場日期、出場點位、持倉天數、損益(%)、勝/負
+    """
+    try:
+        import openpyxl
+        from openpyxl.styles import (PatternFill, Font, Alignment,
+                                     Border, Side, numbers)
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        print("  ⚠️  openpyxl 未安裝，跳過 Excel 輸出")
+        return None
+
+    cutoff = d["date"].iloc[-1] - pd.Timedelta(days=365)
+    trades_1y = [t for t in bt["trades"] if t["entry_date"] >= cutoff]
+
+    # ── 整理成 DataFrame ──────────────────────────────────────
+    rows = []
+    for t in trades_1y:
+        is_open  = "exit_date" not in t
+        dir_str  = "多單" if t["dir_code"] == 1 else "空單"
+        rows.append({
+            "方向":       dir_str,
+            "進場日期":   t["entry_date"].strftime("%Y/%m/%d"),
+            "進場點位":   round(t["entry_price"], 0),
+            "出場日期":   t["exit_date"].strftime("%Y/%m/%d") if not is_open else "持倉中",
+            "出場點位":   round(t["exit_price"], 0)           if not is_open else "-",
+            "持倉天數":   t["n_days"]                         if not is_open else "-",
+            "損益(%)":    round(t["pct_return"], 2)            if not is_open else "-",
+            "結果":       ("獲利 ✅" if t["is_win"] else "虧損 ❌") if not is_open else "持倉中 🔄",
+        })
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "近一年進出場明細"
+
+    # ── 標題列 ───────────────────────────────────────────────
+    title = f"台指策略日報 — 近一年進出場明細（截至 {run_date.strftime('%Y/%m/%d')}）"
+    ws.merge_cells("A1:H1")
+    ws["A1"] = title
+    ws["A1"].font      = Font(name="微軟正黑體", size=14, bold=True, color="FFFFFF")
+    ws["A1"].fill      = PatternFill("solid", fgColor="1E3A5F")
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 32
+
+    # ── 欄位標題 ─────────────────────────────────────────────
+    headers = ["方向", "進場日期", "進場點位", "出場日期", "出場點位", "持倉天數", "損益(%)", "結果"]
+    thin    = Side(style="thin", color="D1D5DB")
+    border  = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for col_idx, h in enumerate(headers, start=1):
+        cell           = ws.cell(row=2, column=col_idx, value=h)
+        cell.font      = Font(name="微軟正黑體", size=11, bold=True, color="FFFFFF")
+        cell.fill      = PatternFill("solid", fgColor="334155")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border    = border
+    ws.row_dimensions[2].height = 22
+
+    # ── 資料列 ───────────────────────────────────────────────
+    fill_long  = PatternFill("solid", fgColor="FEE2E2")   # 淡紅（多單）
+    fill_short = PatternFill("solid", fgColor="DCFCE7")   # 淡綠（空單）
+    fill_open  = PatternFill("solid", fgColor="FEF9C3")   # 淡黃（持倉中）
+    font_win   = Font(name="微軟正黑體", size=11, color="DC2626", bold=True)
+    font_lose  = Font(name="微軟正黑體", size=11, color="16A34A", bold=True)
+    font_base  = Font(name="微軟正黑體", size=11)
+
+    for row_idx, row in enumerate(rows, start=3):
+        is_holding = (row["出場日期"] == "持倉中")
+        is_long    = (row["方向"] == "多單")
+        bg_fill    = fill_open if is_holding else (fill_long if is_long else fill_short)
+        pnl        = row["損益(%)"]
+
+        for col_idx, key in enumerate(headers, start=1):
+            cell           = ws.cell(row=row_idx, column=col_idx, value=row[key])
+            cell.fill      = bg_fill
+            cell.border    = border
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            # 損益欄位特別標色
+            if key == "損益(%)" and isinstance(pnl, float):
+                cell.font = font_win if pnl >= 0 else font_lose
+            elif key == "結果":
+                if "獲利" in str(row[key]):  cell.font = font_win
+                elif "虧損" in str(row[key]): cell.font = font_lose
+                else: cell.font = font_base
+            else:
+                cell.font = font_base
+        ws.row_dimensions[row_idx].height = 20
+
+    # ── 統計摘要列 ───────────────────────────────────────────
+    ws.append([])
+    summary_row = ws.max_row + 1
+    done_trades = [r for r in rows if r["出場日期"] != "持倉中"]
+    n_total  = len(done_trades)
+    n_win    = sum(1 for r in done_trades if "獲利" in str(r["結果"]))
+    n_long   = sum(1 for r in done_trades if r["方向"] == "多單")
+    n_short  = sum(1 for r in done_trades if r["方向"] == "空單")
+    w_long   = sum(1 for r in done_trades if r["方向"] == "多單" and "獲利" in str(r["結果"]))
+    w_short  = sum(1 for r in done_trades if r["方向"] == "空單" and "獲利" in str(r["結果"]))
+    wr_all   = n_win   / n_total  * 100 if n_total  else 0
+    wr_long  = w_long  / n_long   * 100 if n_long   else 0
+    wr_short = w_short / n_short  * 100 if n_short  else 0
+    total_pnl = sum(r["損益(%)"] for r in done_trades if isinstance(r["損益(%)"], float))
+    summary_texts = [
+        f"統計摘要（已出場 {n_total} 筆）",
+        f"整體勝率：{wr_all:.1f}%",
+        f"多單勝率：{wr_long:.1f}%（{n_long} 筆）",
+        f"空單勝率：{wr_short:.1f}%（{n_short} 筆）",
+        f"累積損益：{total_pnl:+.2f}%",
+    ]
+    ws.merge_cells(f"A{summary_row}:H{summary_row}")
+    ws[f"A{summary_row}"] = "　".join(summary_texts)
+    ws[f"A{summary_row}"].font      = Font(name="微軟正黑體", size=11, bold=True, color="1E3A5F")
+    ws[f"A{summary_row}"].fill      = PatternFill("solid", fgColor="E0F2FE")
+    ws[f"A{summary_row}"].alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[summary_row].height = 24
+
+    # ── 欄寬調整 ─────────────────────────────────────────────
+    col_widths = [10, 14, 14, 14, 14, 12, 12, 14]
+    for i, w in enumerate(col_widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    # ── 凍結標題 ─────────────────────────────────────────────
+    ws.freeze_panes = "A3"
+
+    # ── 儲存 ────────────────────────────────────────────────
+    excel_fname = f"台指策略進出場明細_{run_date.strftime('%Y.%m.%d')}.xlsx"
+    excel_path  = output_dir / excel_fname
+    wb.save(str(excel_path))
+    print(f"  ✅  進出場明細已產出：{excel_path}（共 {len(rows)} 筆）")
+    return excel_path
+
+
+
 def generate_daily_report():
     # ★ 使用台灣時間取得日期
     run_date = datetime.now(TW_TZ).date()
@@ -858,11 +991,18 @@ def generate_daily_report():
         try: Path(_p).unlink()
         except: pass
 
+    # ── 產生 Excel 進出場明細 ──────────────────────────────────
+    print(f"\n  產生進出場明細 Excel...", end='', flush=True)
+    excel_path = export_trades_excel(d, bt, run_date, OUTPUT_DIR)
+    print(" 完成" if excel_path else " 跳過（openpyxl 未安裝）")
+
     print(f"\n{'='*60}")
     print(f"  ✅  日報已產出：{output_path}")
+    if excel_path:
+        print(f"  ✅  進出場明細：{excel_path}")
     print(f"{'='*60}")
-    # ★ 回傳 (檔案路徑, 策略狀態)，供 run_and_send.py 組 Email 內文
-    return output_path, state
+    # ★ 回傳 (PPTX路徑, Excel路徑, 策略狀態)，供 run_and_send.py 組 Email 內文
+    return output_path, excel_path, state
 
 
 if __name__=="__main__" or "ipykernel" in sys.modules:
