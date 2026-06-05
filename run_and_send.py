@@ -52,7 +52,7 @@ print("=" * 60)
 # ── 2. 執行日報產生 ─────────────────────────────────────────────
 try:
     from daily_strategy_report import generate_daily_report
-    output_path, state = generate_daily_report()
+    output_path, excel_path, state = generate_daily_report()  # ★ 現在回傳三個值
 except Exception as e:
     print(f"❌ 日報產生失敗：{e}")
     import traceback
@@ -108,6 +108,19 @@ with open(str(output_path), "rb") as f:
     encoders.encode_base64(part)
     part.add_header("Content-Disposition", f'attachment; filename="{en_filename}"')
     msg.attach(part)
+
+# ★ 附上 Excel 進出場明細附件
+if excel_path and Path(str(excel_path)).exists():
+    xl_filename = f"TW_Trade_Detail_{today_str}.xlsx"
+    with open(str(excel_path), "rb") as f:
+        part_xl = MIMEBase("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        part_xl.set_payload(f.read())
+        encoders.encode_base64(part_xl)
+        part_xl.add_header("Content-Disposition", f'attachment; filename="{xl_filename}"')
+        msg.attach(part_xl)
+    print(f"   Excel 進出場明細已附上：{xl_filename}")
+else:
+    print("   ⚠️  Excel 未產生，僅附上 PPTX")
 
 # 寄出
 print(f"\n📧 寄送中：{gmail_user} → {', '.join(to_list)}")
