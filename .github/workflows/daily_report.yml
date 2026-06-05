@@ -43,7 +43,8 @@ jobs:
             numpy \
             matplotlib \
             requests \
-            holidays
+            holidays \
+            openpyxl
 
       # ── 5. 執行日報產生 + 自動寄信 ──────────────────────────
       - name: 📊 Generate report and send email
