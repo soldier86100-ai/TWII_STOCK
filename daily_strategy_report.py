@@ -417,15 +417,17 @@ def backtest(d, ml, ms, gL, gS):
         e=exp[i]
         if not it and e!=0:
             it=True; tr=[ret[i]]; cd=int(e); ei=i
+            # ★ 進場價：使用執行日（訊號觸發後的隔天）的開盤價，與報酬計算一致
             trades.append({"entry_idx":i,"entry_date":d["date"].iloc[i],
-                           "dir_code":cd,"entry_price":close[i]})
+                           "dir_code":cd,"entry_price":open_[i]})
         elif it and e!=0:
             tr.append(ret[i])
         elif it and e==0:
             tr.append(ret[i])
             p=np.prod(1+np.array(tr))-1
+            # ★ 出場價：使用出場日的開盤價，與報酬計算（onight）一致
             trades[-1].update({"exit_idx":i,"exit_date":d["date"].iloc[i],
-                               "exit_price":close[i],"pct_return":p*100,
+                               "exit_price":open_[i],"pct_return":p*100,
                                "n_days":i-ei,"is_win":p>0})
             it=False; tr=[]
     return {"daily_ret":ret,"exp":exp,"pos":pos,"cum":np.cumprod(1+ret),"trades":trades}
