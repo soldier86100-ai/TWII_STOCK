@@ -119,7 +119,7 @@ def fetch_market_data() -> pd.DataFrame:
             print(f"  正在從 Yahoo Finance 下載資料...")
             raw_all = yf.download(
                 tickers=ticker_list,
-                period="24mo",
+                period="5y",          # ★ 延伸至 5 年，確保 3yr 統計與 60MA 溫機資料充足
                 auto_adjust=True,
                 progress=False,
                 group_by="ticker",
@@ -127,7 +127,7 @@ def fetch_market_data() -> pd.DataFrame:
             if raw_all.empty:
                 time.sleep(3)
                 raw_all = yf.download(
-                    tickers=ticker_list, period="24mo",
+                    tickers=ticker_list, period="5y",
                     auto_adjust=True, progress=False, group_by="ticker"
                 )
         except Exception as e:
@@ -453,181 +453,378 @@ def determine_state(d, bt, ml, ms, gL, gS):
             "last_date":d["date"].iloc[i].date()}
 
 
+def _calc_period_stats(d, bt, cutoff):
+    """計算指定起始日之後的績效統計（通用子函式）"""
+    mask = (d["date"] >= cutoff).values
+    if mask.sum() < 5:
+        return {"error": "資料不足"}
+    sub_ret = bt["daily_ret"][mask]
+    sub_exp = bt["exp"][mask]
+    sc  = np.cumprod(1 + sub_ret)
+    tot = (sc[-1] - 1) * 100
+    yrs = mask.sum() / 252
+    trades_p = [t for t in bt["trades"] if "exit_date" in t and t["entry_date"] >= cutoff]
+    n_t = len(trades_p)
+    n_l = sum(1 for t in trades_p if t["dir_code"] ==  1)
+    n_s = sum(1 for t in trades_p if t["dir_code"] == -1)
+    w_l = sum(1 for t in trades_p if t["dir_code"] ==  1 and t["is_win"])
+    w_s = sum(1 for t in trades_p if t["dir_code"] == -1 and t["is_win"])
+    w_t = sum(1 for t in trades_p if t["is_win"])
+    return {
+        "period":       (d["date"][mask].iloc[0].date(), d["date"].iloc[-1].date()),
+        "n_trades":     n_t, "n_long": n_l, "n_short": n_s,
+        "wr_all":       (w_t / n_t * 100) if n_t else 0,
+        "wr_long":      (w_l / n_l * 100) if n_l else 0,
+        "wr_short":     (w_s / n_s * 100) if n_s else 0,
+        "strat_total":  tot,
+        # ★ 未滿一年不年化（短期高報酬放大會誤導），回傳 None 讓表格顯示「—（未滿一年）」
+        "strat_ann":    ((1 + tot / 100) ** (1 / yrs) - 1) * 100 if yrs >= 1.0 else None,
+        "strat_mdd":    ((sc / np.maximum.accumulate(sc) - 1) * 100).min(),
+        "strat_vol":    sub_ret.std() * np.sqrt(252) * 100,
+        "strat_sharpe": sub_ret.mean() * 252 / (sub_ret.std() * np.sqrt(252) + 1e-9),
+        "in_mkt":       (sub_exp != 0).mean() * 100,
+        "in_long":      (sub_exp == 1).mean() * 100,
+        "in_short":     (sub_exp == -1).mean() * 100,
+    }
+
+
+def compute_perf_stats(d, bt):
+    """計算近三年＋今年以來(YTD) 績效統計，回傳 dict with keys '3yr' and 'ytd'"""
+    last_date  = d["date"].iloc[-1]
+    cutoff_3yr = last_date - pd.Timedelta(days=3 * 365)
+    cutoff_ytd = pd.Timestamp(last_date.year, 1, 1)
+    return {
+        "3yr": _calc_period_stats(d, bt, cutoff_3yr),
+        "ytd": _calc_period_stats(d, bt, cutoff_ytd),
+    }
+
+
 def compute_1yr_stats(d, bt):
-    cutoff  = d["date"].iloc[-1]-pd.Timedelta(days=365)
-    mask    = (d["date"]>=cutoff).values
-    if mask.sum()<30: return {"error":"資料不足一年"}
-    sub_ret = bt["daily_ret"][mask]; sub_exp=bt["exp"][mask]
-    sc=np.cumprod(1+sub_ret); tot=(sc[-1]-1)*100; yrs=mask.sum()/252
-    trades_1y=[t for t in bt["trades"] if "exit_date" in t and t["entry_date"]>=cutoff]
-    n_t=len(trades_1y); n_l=sum(1 for t in trades_1y if t["dir_code"]==1)
-    n_s=sum(1 for t in trades_1y if t["dir_code"]==-1)
-    w_l=sum(1 for t in trades_1y if t["dir_code"]==1  and t["is_win"])
-    w_s=sum(1 for t in trades_1y if t["dir_code"]==-1 and t["is_win"])
-    w_t=sum(1 for t in trades_1y if t["is_win"])
-    return {"period":(d["date"][mask].iloc[0].date(),d["date"].iloc[-1].date()),
-            "n_trades":n_t,"n_long":n_l,"n_short":n_s,
-            "wr_all":(w_t/n_t*100) if n_t else 0,
-            "wr_long":(w_l/n_l*100) if n_l else 0,
-            "wr_short":(w_s/n_s*100) if n_s else 0,
-            "strat_total":tot,
-            "strat_ann":((1+tot/100)**(1/yrs)-1)*100,
-            "strat_mdd":((sc/np.maximum.accumulate(sc)-1)*100).min(),
-            "strat_vol":sub_ret.std()*np.sqrt(252)*100,
-            "strat_sharpe":sub_ret.mean()*252/(sub_ret.std()*np.sqrt(252)+1e-9),
-            "in_mkt":(sub_exp!=0).mean()*100,
-            "in_long":(sub_exp==1).mean()*100,
-            "in_short":(sub_exp==-1).mean()*100}
+    """近一年統計（供 Excel 匯出及終端機摘要輸出使用）"""
+    return _calc_period_stats(d, bt, d["date"].iloc[-1] - pd.Timedelta(days=365))
+
 
 
 # ═══════════════════════════════════════════════════════════════
 # 4. 圖檔生成（台股慣例：紅多綠空）
 # ═══════════════════════════════════════════════════════════════
-def make_stats_image(stats, out_path):
-    rows = [
-        ('回測期間',
-         f"{stats['period'][0].strftime('%Y/%m/%d')}~{stats['period'][1].strftime('%Y/%m/%d')}",
-         '#1E3A5F'),
-        ('交易筆數',    f"{stats['n_trades']} 筆",                '#1E3A5F'),
-        ('多單 / 空單', f"{stats['n_long']} / {stats['n_short']}", '#1E3A5F'),
-        ('SEP','',''),
-        ('整體勝率', f"{stats['wr_all']:.1f}%",
-         '#DC2626' if stats['wr_all']>=60 else '#1E3A5F'),
-        ('多頭勝率', f"{stats['wr_long']:.1f}%",
-         '#DC2626' if stats['wr_long']>=60 else '#1E3A5F'),
-        ('空頭勝率', f"{stats['wr_short']:.1f}%",
-         '#DC2626' if stats['wr_short']>=60 else '#1E3A5F'),
-        ('SEP','',''),
-        ('整體累積績效', f"{stats['strat_total']:+.2f}%",
-         '#DC2626' if stats['strat_total']>0 else '#16A34A'),
-        ('SEP','',''),
-        ('策略年化報酬', f"{stats['strat_ann']:+.2f}%",
-         '#DC2626' if stats['strat_ann']>0 else '#16A34A'),
-        ('年化波動度',   f"{stats['strat_vol']:.2f}%",  '#1E3A5F'),
-        ('最大回撤',     f"{stats['strat_mdd']:.2f}%",  '#16A34A'),
-        ('夏普比率',     f"{stats['strat_sharpe']:.2f}", '#DC2626'),
-        ('SEP','',''),
-        ('在市場時間', f"{stats['in_mkt']:.1f}%",   '#1E3A5F'),
-        ('多單時間',   f"{stats['in_long']:.1f}%",  '#DC2626'),
-        ('空單時間',   f"{stats['in_short']:.1f}%", '#16A34A'),
+def add_stats_table_to_slide(slide, stats_3yr, stats_ytd):
+    """
+    在 PPT slide 上建立可編輯的績效統計表（近三年 + 今年以來YTD 對照）。
+    取代原本的 matplotlib 圖片，讓內容可在 PowerPoint 中直接編輯。
+    """
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN
+
+    # ── 定義表格每一列 ────────────────────────────────────────
+    # (標籤, 取值函式, 用於顏色判斷的 key, 顏色規則)
+    # 顏色規則: neutral / pos_red(正=紅負=綠) / neg_green(負=綠,MDD用) / wr(>=60%=紅)
+
+    def _ann_text(s):
+        """年化報酬：不足一年顯示 '—（未滿一年）'，避免短期高報酬誤導"""
+        if "error" in s:
+            return "N/A"
+        v = s.get("strat_ann", None)
+        if v is None:
+            return "— (未滿一年)"
+        return f"{v:+.2f}%"
+
+    ROWS = [
+        ("回測期間",
+         lambda s: f"{s['period'][0]:%Y/%m/%d}~\n{s['period'][1]:%Y/%m/%d}"
+                   if "error" not in s else "資料不足",
+         None, "neutral"),
+        ("交易筆數",
+         lambda s: f"{s.get('n_trades', 0)} 筆" if "error" not in s else "N/A",
+         None, "neutral"),
+        ("多 / 空筆數",
+         lambda s: f"{s.get('n_long', 0)} / {s.get('n_short', 0)}"
+                   if "error" not in s else "N/A",
+         None, "neutral"),
+        ("整體勝率",
+         lambda s: f"{s.get('wr_all', 0):.1f}%"   if "error" not in s else "N/A",
+         "wr_all",       "wr"),
+        ("多頭勝率",
+         lambda s: f"{s.get('wr_long', 0):.1f}%"  if "error" not in s else "N/A",
+         "wr_long",      "wr"),
+        ("空頭勝率",
+         lambda s: f"{s.get('wr_short', 0):.1f}%" if "error" not in s else "N/A",
+         "wr_short",     "wr"),
+        ("累積績效",
+         lambda s: f"{s.get('strat_total', 0):+.2f}%" if "error" not in s else "N/A",
+         "strat_total",  "pos_red"),
+        ("年化報酬",
+         lambda s: _ann_text(s),
+         "strat_ann",    "pos_red"),
+        ("年化波動度",
+         lambda s: f"{s.get('strat_vol', 0):.2f}%"     if "error" not in s else "N/A",
+         None,           "neutral"),
+        ("最大回撤",
+         lambda s: f"{s.get('strat_mdd', 0):.2f}%"     if "error" not in s else "N/A",
+         "strat_mdd",    "neg_green"),
+        ("夏普比率",
+         lambda s: f"{s.get('strat_sharpe', 0):.2f}"   if "error" not in s else "N/A",
+         "strat_sharpe", "pos_red"),
+        ("在市場時間",
+         lambda s: f"{s.get('in_mkt', 0):.1f}%"        if "error" not in s else "N/A",
+         None, "neutral"),
+        ("多單時間",
+         lambda s: f"{s.get('in_long', 0):.1f}%"       if "error" not in s else "N/A",
+         None, "neutral"),
+        ("空單時間",
+         lambda s: f"{s.get('in_short', 0):.1f}%"      if "error" not in s else "N/A",
+         None, "neutral"),
     ]
-    fig, ax = plt.subplots(figsize=(5.3, 7.05), facecolor='white')
-    ax.set_facecolor('white'); ax.axis('off')
-    ax.set_xlim(0,1); ax.set_ylim(0,1)
-    y=0.985; row_h=0.052; sep_h=0.013; alt=0
-    for label, val, color in rows:
-        if label=='SEP': y-=sep_h; continue
-        bg='#F1F5F9' if alt%2==0 else '#FFFFFF'
-        ax.add_patch(plt.Rectangle((0.02,y-row_h),0.96,row_h,
-                                   facecolor=bg,edgecolor='#E2E8F0',linewidth=0.6))
-        ax.text(0.05,y-row_h/2,label,fontsize=14,color='#374151',va='center')
-        ax.text(0.95,y-row_h/2,val,  fontsize=14,color=color,
-                va='center',ha='right',fontweight='bold')
-        y-=row_h; alt+=1
-    plt.savefig(out_path,dpi=130,facecolor='white',bbox_inches='tight',pad_inches=0.03)
-    plt.close()
+
+    n_rows = 1 + len(ROWS)  # 1個欄位標題列 + 資料列
+    tbl_shape = slide.shapes.add_table(
+        n_rows, 3,
+        Inches(0.00), Inches(4.40),
+        Inches(5.41), Inches(6.94)
+    )
+    tbl = tbl_shape.table
+    tbl.columns[0].width = Inches(2.00)   # 指標名稱欄
+    tbl.columns[1].width = Inches(1.705)  # 近三年欄
+    tbl.columns[2].width = Inches(1.705)  # YTD 欄
+
+    # 列高設定：標題列稍高，「回測期間」列雙行需更高
+    tbl.rows[0].height = int(Inches(0.40))
+    tbl.rows[1].height = int(Inches(0.70))  # 回測期間列雙行
+    base_h = int(Inches(0.46))
+    remaining_h = int(Inches(6.94) - Inches(0.40) - Inches(0.70))
+    per_row_h   = remaining_h // (len(ROWS) - 1)
+    for i in range(2, n_rows):
+        tbl.rows[i].height = per_row_h
+
+    # ── 顏色常數 ─────────────────────────────────────────────
+    C        = RGBColor
+    BG_HDR   = (30, 58, 95)
+    BG_ALT1  = (241, 245, 249)
+    BG_ALT2  = (255, 255, 255)
+    FG_WHITE = (255, 255, 255)
+    FG_BLUE  = (30, 58, 95)
+    FG_RED   = (220, 38, 38)
+    FG_GREEN = (22, 163, 74)
+    FG_GOLD  = (255, 215, 60)
+    FG_GREY  = (100, 116, 139)
+
+    def _w(row, col, text, fg=FG_WHITE, bg=BG_HDR,
+           size=14, bold=False, align=PP_ALIGN.CENTER, wrap=False):
+        cell = tbl.cell(row, col)
+        cell.fill.solid()
+        cell.fill.fore_color.rgb = C(*bg)
+        tf = cell.text_frame
+        tf.word_wrap = wrap
+        tf.margin_top    = Pt(3.6)
+        tf.margin_bottom = Pt(3.6)
+        tf.margin_left   = Pt(7.2)
+        tf.margin_right  = Pt(7.2)
+        # 支援「\n」換行（用於回測期間日期）
+        lines = text.split('\n')
+        for li, line in enumerate(lines):
+            if li == 0:
+                p = tf.paragraphs[0]
+            else:
+                p = tf.add_paragraph()
+            p.alignment = align
+            run = p.add_run()
+            run.text = line
+            run.font.size  = Pt(size)
+            run.font.bold  = bold
+            run.font.color.rgb = C(*fg)
+            run.font.name  = "微軟正黑體"
+
+    def _fg(stats, key, ctype):
+        if key is None or "error" in stats:
+            return FG_BLUE
+        val = stats.get(key, None)
+        if val is None:
+            return FG_GREY   # 「—（未滿一年）」用灰色
+        if ctype == "wr":
+            return FG_RED if val >= 60 else FG_BLUE
+        elif ctype == "pos_red":
+            return FG_RED if val > 0 else (FG_GREEN if val < 0 else FG_BLUE)
+        elif ctype == "neg_green":
+            return FG_GREEN if val < 0 else FG_BLUE
+        return FG_BLUE
+
+    # ── 欄位標題列 (row 0) ───────────────────────────────────
+    _w(0, 0, "績效指標",       fg=FG_WHITE, bg=BG_HDR, size=14, bold=True)
+    _w(0, 1, "近三年",          fg=FG_WHITE, bg=BG_HDR, size=14, bold=True)
+    _w(0, 2, "今年以來 (YTD)", fg=FG_GOLD,  bg=BG_HDR, size=14, bold=True)
+
+    # ── 資料列 (row 1 起) ────────────────────────────────────
+    for r, (label, val_fn, key, ctype) in enumerate(ROWS, start=1):
+        bg      = BG_ALT1 if r % 2 == 1 else BG_ALT2
+        is_bold = (ctype != "neutral")
+        v3  = val_fn(stats_3yr)
+        vy  = val_fn(stats_ytd)
+        fg3 = _fg(stats_3yr, key, ctype)
+        fgy = _fg(stats_ytd, key, ctype)
+        
+        # 統一字體大小為 14pt，除了特例縮小
+        sz_l = 14
+        sz_3 = 14
+        sz_y = 14
+        
+        # 特例：未滿一年文字縮小
+        if v3.startswith("—"): sz_3 = 10
+        if vy.startswith("—"): sz_y = 10
+        
+        _w(r, 0, label, fg=(55, 65, 81), bg=bg, size=sz_l, bold=False, align=PP_ALIGN.CENTER)
+        _w(r, 1, v3, fg=fg3, bg=bg, size=sz_3, bold=is_bold and not v3.startswith("—"))
+        _w(r, 2, vy, fg=fgy, bg=bg, size=sz_y, bold=is_bold and not vy.startswith("—"))
 
 
-def make_factor_image(d, out_path):
+
+def add_factor_table_to_slide(slide, d):
     """
-    重要因子最新狀況
-    PPT 插入：5.30" × 7.24"  →  figsize=(5.3, 7.24)
+    在 PPT slide 上建立可編輯的因子狀況表（取代原本的 matplotlib 圖片）。
     """
-    i=len(d)-1; p=max(0,i-1)
-    def g(c,idx=i):
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN
+
+    i = len(d) - 1;  p = max(0, i - 1)
+    def g(c, idx=i):
         try:    return float(d[c].iloc[idx])
         except: return 0.0
 
-    twii=g('TWII'); tp=g('TWII',p)
-    twii_chg=(twii/tp-1)*100 if tp>0 else 0
-    bias=g('乖離'); rsi=g('RSI'); rp=g('RSI',p); mom5=g('MOM5')
-    ef=g('EF'); efp=g('EF',p); ef20=g('EF_MA20'); ef60=g('EF_MA60')
-    sox=g('SOX'); soxp=g('SOX',p)
-    sox_chg=(sox/soxp-1)*100 if soxp>0 else 0
-    sox20=g('SOX_MA20'); sox60=g('SOX_MA60')
-    tsmc=g('TSMC_TW'); tsmcp=g('TSMC_TW',p)
-    tsmc_chg=(tsmc/tsmcp-1)*100 if tsmcp>0 else 0
-    tvol=g('TSMC_Vol'); tvma=g('TS_VolMA')
-    vr=tvol/tvma if tvma>0 else 0
-    adr=g('ADR_Premium'); adrp=g('ADR_Premium',p); adrz=g('ADR_Z')
-    fi=g('FI_Net'); fi5=g('FI_5MA'); fiz=g('FI_Z')
+    # ── 計算各因子最新數值 ────────────────────────────────────
+    twii = g('TWII');      tp   = g('TWII', p)
+    twii_chg = (twii/tp-1)*100 if tp > 0 else 0
+    bias = g('乖離');      rsi  = g('RSI');  rp = g('RSI', p)
+    mom5 = g('MOM5')
+    ef   = g('EF');        efp  = g('EF', p); ef20 = g('EF_MA20'); ef60 = g('EF_MA60')
+    sox  = g('SOX');       soxp = g('SOX', p)
+    sox_chg = (sox/soxp-1)*100 if soxp > 0 else 0
+    sox20 = g('SOX_MA20'); sox60 = g('SOX_MA60')
+    tsmc = g('TSMC_TW');   tsmcp = g('TSMC_TW', p)
+    tsmc_chg = (tsmc/tsmcp-1)*100 if tsmcp > 0 else 0
+    tvol = g('TSMC_Vol');  tvma  = g('TS_VolMA')
+    vr   = tvol/tvma if tvma > 0 else 0
+    adrz = g('ADR_Z')
+    fi   = g('FI_Net');    fi5 = g('FI_5MA');  fiz = g('FI_Z')
 
-    def sta(up,dn,cond): return (up,'g') if cond else (dn,'r')
-    sox_s,sox_c=(('雙均偏多','g') if sox>sox20 and sox>sox60 else
-                 ('雙均偏空','r') if sox<sox20 and sox<sox60 else ('震盪','n'))
-
-    rows = [
-        ('GROUP','加權指數 (TAIEX)',None,None),
-        ('收盤指數',   f"{twii:,.0f}",   f"{twii_chg:+.2f}%",'g' if twii_chg>0 else 'r'),
-        ('季線乖離率', f"{bias:+.2f}%",
-            '超賣' if bias<-8 else ('超買' if bias>8 else '常態'),
-            'g' if bias<-8 else ('r' if bias>8 else 'n')),
-        ('RSI(14)',    f"{rsi:.1f}",     f"{rsi-rp:+.1f}",
-            'g' if rsi<40 else ('r' if rsi>55 else 'n')),
-        ('5日動量',    f"{mom5:+.2f}%",
-            '強多' if mom5>2 else ('強空' if mom5<-2 else '中性'),
-            'g' if mom5>2 else ('r' if mom5<-2 else 'n')),
-
-        ('GROUP','風格輪動 (電金比)',None,None),
-        ('電金比',   f"{ef:.4f}",   f"{ef-efp:+.4f}", 'g' if ef>efp else 'r'),
-        ('vs 月線',  f"{ef20:.4f}", *sta('站上','跌破',ef>ef20)),
-        ('vs 季線',  f"{ef60:.4f}", *sta('站上','跌破',ef>ef60)),
-
-        ('GROUP','半導體 (海外+本土)',None,None),
-        ('費城半導體', f"{sox:,.0f}",  f"{sox_chg:+.2f}%", 'g' if sox_chg>0 else 'r'),
-        ('台積電現貨', f"{tsmc:,.0f}", f"{tsmc_chg:+.2f}%",'g' if tsmc_chg>0 else 'r'),
-        ('台積量比',   f"{vr:.2f}x",
-            '爆量' if vr>1.5 else '正常','r' if vr>1.5 else 'n'),
-
-        ('GROUP','海外資金面',None,None),
-        ('ADR Z-score', f"{adrz:+.2f}s",
-            '搶單' if adrz>0.8 else ('撤退' if adrz<-1.0 else '中性'),
-            'g' if adrz>0.8 else ('r' if adrz<-1.0 else 'n')),
-        ('外資今日(億)', f"{fi:+.1f}",  '買超' if fi>0 else '賣超', 'g' if fi>0 else 'r'),
-        ('外資 5MA(億)', f"{fi5:+.1f}", '連買' if fi5>0 else '連賣','g' if fi5>0 else 'r'),
-        ('外資 Z-score', f"{fiz:+.2f}s",
-            '強買超' if fiz>1.2 else ('強賣超' if fiz<-1.2 else '中性'),
-            'g' if fiz>1.2 else ('r' if fiz<-1.2 else 'n')),
+    # ── 表格內容 ─────────────────────────────────────────────
+    # ('HDR',) 表欄位標題列; ('GROUP', 標題) 表分組列; ('DATA', 因子, 值, 狀態, 顏色)
+    TABLE_DATA = [
+        ('HDR',),
+        ('GROUP', '加權指數 (TAIEX)'),
+        ('DATA', '收盤指數',   f"{twii:,.0f}",   f"{twii_chg:+.2f}%",
+         'red' if twii_chg > 0 else 'green'),
+        ('DATA', '季線乖離率', f"{bias:+.2f}%",
+         '超賣' if bias < -8 else ('超買' if bias > 8 else '常態'),
+         'red' if bias < -8 else ('green' if bias > 8 else 'neutral')),
+        ('DATA', 'RSI(14)',    f"{rsi:.1f}",      f"{rsi - rp:+.1f}",
+         'red' if rsi < 40 else ('green' if rsi > 55 else 'neutral')),
+        ('DATA', '5日動量',    f"{mom5:+.2f}%",
+         '強多' if mom5 > 2 else ('強空' if mom5 < -2 else '中性'),
+         'red' if mom5 > 2 else ('green' if mom5 < -2 else 'neutral')),
+        ('GROUP', '風格輪動 (電金比)'),
+        ('DATA', '電金比',   f"{ef:.4f}",  f"{ef - efp:+.4f}",
+         'red' if ef > efp else 'green'),
+        ('DATA', 'vs 月線',  f"{ef20:.4f}", '站上' if ef > ef20 else '跌破',
+         'red' if ef > ef20 else 'green'),
+        ('DATA', 'vs 季線',  f"{ef60:.4f}", '站上' if ef > ef60 else '跌破',
+         'red' if ef > ef60 else 'green'),
+        ('GROUP', '半導體 (海外+本土)'),
+        ('DATA', '費城半導體', f"{sox:,.0f}",  f"{sox_chg:+.2f}%",
+         'red' if sox_chg > 0 else 'green'),
+        ('DATA', '台積電現貨', f"{tsmc:,.0f}", f"{tsmc_chg:+.2f}%",
+         'red' if tsmc_chg > 0 else 'green'),
+        ('DATA', '台積量比',   f"{vr:.2f}x",
+         '爆量' if vr > 1.5 else '正常',
+         'green' if vr > 1.5 else 'neutral'),
+        ('GROUP', '海外資金面'),
+        ('DATA', 'ADR Z-score',   f"{adrz:+.2f}σ",
+         '搶單' if adrz > 0.8 else ('撤退' if adrz < -1.0 else '中性'),
+         'red' if adrz > 0.8 else ('green' if adrz < -1.0 else 'neutral')),
+        ('DATA', '外資今日(億)', f"{fi:+.1f}",
+         '買超' if fi > 0 else '賣超',
+         'red' if fi > 0 else 'green'),
+        ('DATA', '外資 5MA(億)', f"{fi5:+.1f}",
+         '連買' if fi5 > 0 else '連賣',
+         'red' if fi5 > 0 else 'green'),
+        ('DATA', '外資 Z-score', f"{fiz:+.2f}σ",
+         '強買超' if fiz > 1.2 else ('強賣超' if fiz < -1.2 else '中性'),
+         'red' if fiz > 1.2 else ('green' if fiz < -1.2 else 'neutral')),
     ]
 
-    # ★ 台股慣例：g(多/漲)=紅色, r(空/跌)=綠色
-    cmap = {'g':'#DC2626','r':'#16A34A','n':'#64748B'}
+    n_rows = len(TABLE_DATA)
+    tbl_shape = slide.shapes.add_table(
+        n_rows, 3,
+        Inches(5.70), Inches(4.40),
+        Inches(5.30), Inches(6.95)
+    )
+    tbl = tbl_shape.table
+    tbl.columns[0].width = Inches(2.00)
+    tbl.columns[1].width = Inches(1.65)
+    tbl.columns[2].width = Inches(1.65)
 
-    fig, ax = plt.subplots(figsize=(5.3, 7.24), facecolor='white')
-    ax.set_facecolor('white'); ax.axis('off')
-    ax.set_xlim(0,1); ax.set_ylim(0,1)
+    # 列高設定
+    hdr_h  = int(Inches(0.349))
+    grp_h  = int(Inches(0.489))
+    data_h = int(Inches(0.332))
+    for r, row_data in enumerate(TABLE_DATA):
+        if row_data[0] == 'HDR':    tbl.rows[r].height = hdr_h
+        elif row_data[0] == 'GROUP': tbl.rows[r].height = grp_h
+        else:                        tbl.rows[r].height = data_h
 
-    ax.text(0.04, 0.988, '因子',   fontsize=13, color='#64748B',
-            fontweight='bold', va='top')
-    ax.text(0.57, 0.988, '當前值', fontsize=13, color='#64748B',
-            fontweight='bold', va='top', ha='center')
-    ax.text(0.87, 0.988, '狀態',   fontsize=13, color='#64748B',
-            fontweight='bold', va='top', ha='center')
+    # ── 顏色常數 ─────────────────────────────────────────────
+    C        = RGBColor
+    BG_HDR   = (30, 58, 95)
+    BG_GROUP = (51, 65, 85)
+    BG_ALT1  = (250, 250, 250)
+    BG_ALT2  = (255, 255, 255)
+    FG_WHITE = (255, 255, 255)
+    FG_BLUE  = (30, 58, 95)
+    FG_RED   = (220, 38, 38)
+    FG_GREEN = (22, 163, 74)
+    FG_GREY  = (100, 116, 139)
+    CMAP     = {'red': FG_RED, 'green': FG_GREEN, 'neutral': FG_GREY}
 
-    y = 0.960
-    rh = 0.053
+    def _w(row, col, text, fg=FG_WHITE, bg=BG_HDR,
+           size=14, bold=False, align=PP_ALIGN.CENTER):
+        cell = tbl.cell(row, col)
+        cell.fill.solid()
+        cell.fill.fore_color.rgb = C(*bg)
+        tf = cell.text_frame
+        tf.word_wrap = False
+        tf.margin_top    = Pt(3.6)
+        tf.margin_bottom = Pt(3.6)
+        tf.margin_left   = Pt(7.2)
+        tf.margin_right  = Pt(7.2)
+        p = tf.paragraphs[0]
+        p.alignment = align
+        run = p.add_run()
+        run.text = text
+        run.font.size  = Pt(size)
+        run.font.bold  = bold
+        run.font.color.rgb = C(*fg)
+        run.font.name  = "微軟正黑體"
 
-    for row in rows:
-        if row[0] == 'GROUP':
-            ax.add_patch(plt.Rectangle((0.02,y-rh),0.96,rh,
-                                       facecolor='#1E3A5F',edgecolor='none'))
-            ax.text(0.05,y-rh/2,row[1],
-                    fontsize=13,color='white',fontweight='bold',va='center')
-            y -= rh
+    data_cnt = 0
+    for r, row_data in enumerate(TABLE_DATA):
+        rtype = row_data[0]
+        if rtype == 'HDR':
+            _w(r, 0, '因子',   fg=FG_WHITE, bg=BG_HDR, size=14, bold=True)
+            _w(r, 1, '當前值', fg=FG_WHITE, bg=BG_HDR, size=14, bold=True)
+            _w(r, 2, '狀態',   fg=FG_WHITE, bg=BG_HDR, size=14, bold=True)
+        elif rtype == 'GROUP':
+            for col in range(3):
+                _w(r, col, row_data[1] if col == 0 else '',
+                   fg=FG_WHITE, bg=BG_GROUP, size=14, bold=True,
+                   align=PP_ALIGN.CENTER)  # 分組標題也置中
         else:
-            lbl, val, sts, ch = row
-            ax.add_patch(plt.Rectangle((0.02,y-rh),0.96,rh,
-                                       facecolor='#FAFAFA',edgecolor='#E2E8F0',linewidth=0.5))
-            ax.text(0.04,y-rh/2, lbl, fontsize=13, color='#1E293B', va='center')
-            ax.text(0.57,y-rh/2, val, fontsize=14, color='#1E3A5F',
-                    ha='center',va='center',fontweight='bold')
-            ax.text(0.87,y-rh/2, sts, fontsize=13, color=cmap.get(ch,'#64748B'),
-                    ha='center',va='center',fontweight='bold')
-            y -= rh
+            _, label, val, status, color = row_data
+            bg = BG_ALT1 if data_cnt % 2 == 0 else BG_ALT2
+            _w(r, 0, label,  fg=(55, 65, 81), bg=bg, size=14, align=PP_ALIGN.CENTER)
+            _w(r, 1, val,    fg=FG_BLUE, bg=bg, size=14, bold=True)
+            _w(r, 2, status, fg=CMAP.get(color, FG_GREY), bg=bg, size=14, bold=True)
+            data_cnt += 1
 
-    plt.savefig(out_path, dpi=130, facecolor='white',
-                bbox_inches='tight', pad_inches=0.03)
-    plt.close()
 
 
 def make_chart(d, bt, out_path):
@@ -731,7 +928,8 @@ def make_chart(d, bt, out_path):
 # ═══════════════════════════════════════════════════════════════
 # 5. PPT 套版生成
 # ═══════════════════════════════════════════════════════════════
-def generate_pptx(run_date, state, stats_img, factor_img, chart_img, output_path):
+def generate_pptx(run_date, state, stats_3yr, stats_ytd, d, chart_img, output_path):
+    """生成 PPTX 日報（績效統計表與因子表均為可編輯的 PPT 原生表格）"""
     try:
         from pptx import Presentation
         from pptx.util import Inches, Pt
@@ -740,56 +938,67 @@ def generate_pptx(run_date, state, stats_img, factor_img, chart_img, output_path
         raise ImportError("請先安裝 python-pptx：pip install python-pptx")
     if not TEMPLATE_PATH.exists():
         raise FileNotFoundError(f"模板不存在：{TEMPLATE_PATH}")
-    prs=Presentation(str(TEMPLATE_PATH)); slide=prs.slides[0]
+    prs = Presentation(str(TEMPLATE_PATH))
+    slide = prs.slides[0]
+
+    # ── 更新日期與策略建議文字 ──────────────────────────────
     for shape in slide.shapes:
-        if shape.name=='群組 28':
+        if shape.name == '群組 28':
             for sub in shape.shapes:
                 if sub.has_text_frame and (
                         str(run_date.year) in sub.text_frame.text or
                         '/' in sub.text_frame.text):
-                    paras=list(sub.text_frame.paragraphs)
-                    for p_idx,p in enumerate(paras):
+                    paras = list(sub.text_frame.paragraphs)
+                    for p_idx, p in enumerate(paras):
                         if not p.runs: continue
-                        if   p_idx==0: p.runs[0].text=str(run_date.year)
-                        elif p_idx==1: p.runs[0].text=f"{run_date.month:02d}/{run_date.day:02d}"
+                        if   p_idx == 0: p.runs[0].text = str(run_date.year)
+                        elif p_idx == 1: p.runs[0].text = f"{run_date.month:02d}/{run_date.day:02d}"
         elif '文字方塊 4' in shape.name:
             for p in shape.text_frame.paragraphs:
-                if len(p.runs)>=7:
-                    rec=state["recommendation"]; bias=state["bias"]
-                    p.runs[2].text=rec+"　　　　 　　"
-                    # ★ 多=紅, 空=綠
-                    if   rec in ("多單續抱","多單建倉","空單轉多"):
-                        p.runs[2].font.color.rgb=RGBColor.from_string("DC2626")
-                    elif rec in ("空單續抱","空單建倉","多單轉空"):
-                        p.runs[2].font.color.rgb=RGBColor.from_string("16A34A")
+                if len(p.runs) >= 7:
+                    rec = state["recommendation"]; bias = state["bias"]
+                    p.runs[2].text = rec + "　　　　 　　"
+                    if   rec in ("多單續抱", "多單建倉", "空單轉多"):
+                        p.runs[2].font.color.rgb = RGBColor.from_string("DC2626")
+                    elif rec in ("空單續抱", "空單建倉", "多單轉空"):
+                        p.runs[2].font.color.rgb = RGBColor.from_string("16A34A")
                     else:
-                        p.runs[2].font.color.rgb=RGBColor.from_string("1E293B")
-                    p.runs[6].text=bias
-                    if   bias=="偏多": p.runs[6].font.color.rgb=RGBColor.from_string("DC2626")
-                    elif bias=="偏空": p.runs[6].font.color.rgb=RGBColor.from_string("16A34A")
-                    else:              p.runs[6].font.color.rgb=RGBColor.from_string("1E293B")
-    _EMU=914400
+                        p.runs[2].font.color.rgb = RGBColor.from_string("1E293B")
+                    p.runs[6].text = bias
+                    if   bias == "偏多": p.runs[6].font.color.rgb = RGBColor.from_string("DC2626")
+                    elif bias == "偏空": p.runs[6].font.color.rgb = RGBColor.from_string("16A34A")
+                    else:                p.runs[6].font.color.rgb = RGBColor.from_string("1E293B")
+
+    _EMU = 914400
     for _s in slide.shapes:
-        if _s.name=='文字方塊 29':
-            _s.top=int(11.64*_EMU); _s.height=int(4.61*_EMU); break
-    slide.shapes.add_picture(stats_img,  Inches(0.00),Inches(4.40),
-                             width=Inches(5.30),height=Inches(7.05))
-    slide.shapes.add_picture(factor_img, Inches(5.70),Inches(4.40),
-                             width=Inches(5.30),height=Inches(7.24))
-    slide.shapes.add_picture(chart_img,  Inches(-0.08),Inches(12.25),
-                             width=Inches(11.08),height=Inches(3.95))
-    tb=slide.shapes.add_textbox(Inches(0.3),Inches(3.50),Inches(10.5),Inches(0.30))
-    tf=tb.text_frame
-    tf.margin_left=tf.margin_right=tf.margin_top=tf.margin_bottom=0
-    r=tf.paragraphs[0].add_run()
-    r.text=(f"加權收盤 {state['last_close']:,.0f}  |  "
-            f"多頭得分 ml={state['ml']:.2f} (門檻 {LE})  |  "
-            f"空頭得分 ms={state['ms']:.2f} (門檻 {SE})  |  "
-            f"大環境門票：多 {'OK' if state['gL'] else 'NG'}  "
-            f"空 {'OK' if state['gS'] else 'NG'}")
-    r.font.size=Pt(11); r.font.name="Microsoft JhengHei"
-    r.font.color.rgb=RGBColor.from_string("475569")
+        if _s.name == '文字方塊 29':
+            _s.top = int(11.64 * _EMU); _s.height = int(4.61 * _EMU); break
+
+    # ── 折線圖（圖片，維持不變）──────────────────────────────
+    slide.shapes.add_picture(chart_img, Inches(-0.08), Inches(12.25),
+                             width=Inches(11.08), height=Inches(3.95))
+
+    # ── 可編輯績效統計表（左）────────────────────────────────
+    add_stats_table_to_slide(slide, stats_3yr, stats_ytd)
+
+    # ── 可編輯因子狀況表（右）────────────────────────────────
+    add_factor_table_to_slide(slide, d)
+
+    # ── 得分說明列 ────────────────────────────────────────────
+    tb = slide.shapes.add_textbox(Inches(0.3), Inches(3.50), Inches(10.5), Inches(0.30))
+    tf = tb.text_frame
+    tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
+    r = tf.paragraphs[0].add_run()
+    r.text = (f"加權收盤 {state['last_close']:,.0f}  |  "
+              f"多頭得分 ml={state['ml']:.2f} (門檻 {LE})  |  "
+              f"空頭得分 ms={state['ms']:.2f} (門檻 {SE})  |  "
+              f"大環境門票：多 {'OK' if state['gL'] else 'NG'}  "
+              f"空 {'OK' if state['gS'] else 'NG'}")
+    r.font.size = Pt(11); r.font.name = "Microsoft JhengHei"
+    r.font.color.rgb = RGBColor.from_string("475569")
+
     prs.save(str(output_path))
+
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -951,7 +1160,8 @@ def generate_daily_report():
     ml,ms,gL,gS=compute_scores(d)
     bt=backtest(d,ml,ms,gL,gS)
     state=determine_state(d,bt,ml,ms,gL,gS)
-    stats=compute_1yr_stats(d,bt)
+    stats=compute_1yr_stats(d,bt)      # 近一年摘要（終端機輸出用）
+    perf=compute_perf_stats(d,bt)      # 近三年 + YTD（PPT 表格用）
 
     i_last=len(d)-1
     print(f"\n  策略建議：{state['recommendation']}　｜　模型分析：{state['bias']}")
@@ -965,6 +1175,11 @@ def generate_daily_report():
         print(f"\n  近一年　{stats['n_trades']} 筆  勝率 {stats['wr_all']:.1f}%  "
               f"累積 {stats['strat_total']:+.2f}%  "
               f"MDD {stats['strat_mdd']:.2f}%  Sharpe {stats['strat_sharpe']:.2f}")
+    s3 = perf["3yr"]
+    if "error" not in s3:
+        print(f"  近三年　{s3['n_trades']} 筆  勝率 {s3['wr_all']:.1f}%  "
+              f"累積 {s3['strat_total']:+.2f}%  "
+              f"MDD {s3['strat_mdd']:.2f}%  Sharpe {s3['strat_sharpe']:.2f}")
 
     open_trades=[t for t in bt["trades"] if "exit_date" not in t]
     if open_trades:
@@ -974,22 +1189,18 @@ def generate_daily_report():
               f"  進場價 {ot['entry_price']:,.0f}")
 
     OUTPUT_DIR.mkdir(exist_ok=True)
-    stats_img  =str(OUTPUT_DIR/"_tmp_stats.png")
-    factor_img =str(OUTPUT_DIR/"_tmp_factors.png")
-    chart_img  =str(OUTPUT_DIR/"_tmp_chart.png")
-    print("\n  生成圖檔...",end='',flush=True)
-    make_stats_image(stats,stats_img)
-    make_factor_image(d,factor_img)
-    make_chart(d,bt,chart_img)
+    chart_img = str(OUTPUT_DIR/"_tmp_chart.png")   # ★ 只剩折線圖需要暫存
+    print("\n  生成折線圖...", end='', flush=True)
+    make_chart(d, bt, chart_img)
     print(" 完成")
 
     fname=f"台股策略日報_{run_date.strftime('%Y.%m.%d')}.pptx"
     output_path=OUTPUT_DIR/fname
-    print(f"  套版輸出...",end='',flush=True)
-    generate_pptx(run_date,state,stats_img,factor_img,chart_img,output_path)
+    print(f"  套版輸出...", end='', flush=True)
+    generate_pptx(run_date, state, perf["3yr"], perf["ytd"], d, chart_img, output_path)
     print(" 完成")
 
-    for _p in (stats_img,factor_img,chart_img):
+    for _p in (chart_img,):
         try: Path(_p).unlink()
         except: pass
 
