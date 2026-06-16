@@ -489,12 +489,12 @@ def _calc_period_stats(d, bt, cutoff):
 
 
 def compute_perf_stats(d, bt):
-    """計算近三年＋今年以來(YTD) 績效統計，回傳 dict with keys '3yr' and 'ytd'"""
-    last_date  = d["date"].iloc[-1]
-    cutoff_3yr = last_date - pd.Timedelta(days=3 * 365)
-    cutoff_ytd = pd.Timestamp(last_date.year, 1, 1)
+    """計算「成立至今（2021/06/16起）」＋今年以來(YTD) 績效統計，回傳 dict with keys '3yr' and 'ytd'"""
+    # 起始日固定為策略成立日 2021/06/16
+    INCEPTION_DATE = pd.Timestamp(2021, 6, 16)
+    cutoff_ytd = pd.Timestamp(d["date"].iloc[-1].year, 1, 1)
     return {
-        "3yr": _calc_period_stats(d, bt, cutoff_3yr),
+        "3yr": _calc_period_stats(d, bt, INCEPTION_DATE),
         "ytd": _calc_period_stats(d, bt, cutoff_ytd),
     }
 
@@ -651,7 +651,7 @@ def add_stats_table_to_slide(slide, stats_3yr, stats_ytd):
 
     # ── 欄位標題列 (row 0) ───────────────────────────────────
     _w(0, 0, "績效指標",       fg=FG_WHITE, bg=BG_HDR, size=14, bold=True)
-    _w(0, 1, "近三年",          fg=FG_WHITE, bg=BG_HDR, size=14, bold=True)
+    _w(0, 1, "成立至今",       fg=FG_WHITE, bg=BG_HDR, size=14, bold=True)
     _w(0, 2, "今年以來 (YTD)", fg=FG_GOLD,  bg=BG_HDR, size=14, bold=True)
 
     # ── 資料列 (row 1 起) ────────────────────────────────────
