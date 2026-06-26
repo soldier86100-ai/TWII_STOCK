@@ -117,9 +117,15 @@ def fetch_market_data() -> pd.DataFrame:
         try:
             import time
             print(f"  正在從 Yahoo Finance 下載資料...")
+            # ★ 固定起始日 2019-01-01，原因：
+            #   1. 策略成立日為 2021/06/16，MA120 需要 ~6 個月暖機期
+            #   2. 若從 2021/06/01 抓，2021/06/16 時 MA60/MA120 尚未算滿，指標不準
+            #   3. 從 2019 年起抓，到 2021/06/16 已有約 2.5 年暖機，指標完全穩定
+            #   4. 績效統計仍從 INCEPTION_DATE=2021/06/16 開始，不受影響
+            DATA_START = "2019-01-01"
             raw_all = yf.download(
                 tickers=ticker_list,
-                period="5y",          # ★ 延伸至 5 年，確保 3yr 統計與 60MA 溫機資料充足
+                start=DATA_START,
                 auto_adjust=True,
                 progress=False,
                 group_by="ticker",
@@ -127,7 +133,7 @@ def fetch_market_data() -> pd.DataFrame:
             if raw_all.empty:
                 time.sleep(3)
                 raw_all = yf.download(
-                    tickers=ticker_list, period="5y",
+                    tickers=ticker_list, start=DATA_START,
                     auto_adjust=True, progress=False, group_by="ticker"
                 )
         except Exception as e:
