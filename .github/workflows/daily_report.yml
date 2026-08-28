@@ -1,18 +1,26 @@
 name: 台指策略日報自動寄信
-
 on:
   # ── 主要觸發：由 cron-job.org 在台灣時間 07:30 精準呼叫 GitHub API ──
   repository_dispatch:
     types: [trigger-daily-report]
-
   # ── 手動觸發按鈕（可在 GitHub Actions 頁面測試）──
   workflow_dispatch:
+    inputs:
+      rebuild_cache:
+        description: "清空快取重建（策略邏輯變更後才需要，平常留空）"
+        required: false
+        default: ""
+
+# ★ 新增：允許本次執行把更新後的快取檔 commit 回 repo，
+#   否則 cache/ 只存在當次執行的暫存容器裡，跑完就消失，
+#   等於每天都是「第一次執行」，快照凍結機制完全沒有作用。
+permissions:
+  contents: write
 
 jobs:
   generate-and-send:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
       # ── 1. 下載儲存庫程式碼 ──────────────────────────────────
       - name: 📥 Checkout repository
@@ -49,17 +57,45 @@ jobs:
       # ── 5. 執行日報產生 + 自動寄信 ──────────────────────────
       - name: 📊 Generate report and send email
         env:
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_PASS: ${{ secrets.GMAIL_PASS }}
-          TO_EMAIL:   ${{ secrets.TO_EMAIL }}
+          GMAIL_USER:    ${{ secrets.GMAIL_USER }}
+          GMAIL_PASS:    ${{ secrets.GMAIL_PASS }}
+          TO_EMAIL:      ${{ secrets.TO_EMAIL }}
+          REBUILD_CACHE: ${{ github.event.inputs.rebuild_cache }}
         run: python run_and_send.py
 
-      # ── 6. 上傳 PPTX 作為 Artifact（備份，可選）────────────
+      # ── 6. ★ 新增：把當天更新後的快取回寫進 repo ────────────
+      #   if: always() → 就算寄信那步失敗，當天算出來的快照也要保留，
+      #   不然明天重跑又會抓到同一批「未成熟」資料，一樣會變動。
+      - name: 🔒 Commit signal/market cache
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f cache/ 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "快照無變更，略過 commit"
+          else
+            git commit -m "chore: update signal/market cache $(date -u +%Y-%m-%d)"
+            git pull --rebase --autostash origin ${{ github.ref_name }} || true
+            git push
+          fi
+
+      # ── 7. 上傳 PPTX 作為 Artifact（備份，可選）────────────
       - name: 💾 Upload report as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: 台股策略日報
           path: reports/*.pptx
+          retention-days: 30
+          if-no-files-found: ignore
+
+      # ── 8. ★ 順手也把 Excel 進出場明細存成 Artifact ─────────
+      - name: 💾 Upload trade detail Excel as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 進出場明細
+          path: reports/*.xlsx
           retention-days: 30
           if-no-files-found: ignore
