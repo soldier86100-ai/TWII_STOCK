@@ -1443,5 +1443,12 @@ def generate_daily_report():
     return output_path, excel_path, state
 
 
-if __name__=="__main__" or "ipykernel" in sys.modules:
+# ★ v2.9 修正：拿掉 "ipykernel" in sys.modules 這個條件。
+#   原因：只要在 Jupyter 環境裡，這個條件永遠是 True，代表任何其他程式
+#   （例如 bootstrap_signal_cache.py）只要 import 這支檔案來借用裡面的
+#   函式，就會意外觸發整個日報流程自動執行一次（含即時抓資料、寄信等）。
+#   __name__ == "__main__" 已經足夠：不管是 python 直接執行、%run，
+#   或是把程式碼整個貼進 Jupyter cell 執行，都會正確觸發；
+#   只有在被其他程式 import 時才不會觸發——這才是正確、預期的行為。
+if __name__ == "__main__":
     generate_daily_report()
