@@ -1,5 +1,5 @@
 """
-台指策略日報自動生成 v2.8
+台指策略日報自動生成 v2.9
 ================================================================
 每天早上 8:00 由 GitHub Actions 自動執行
 
@@ -19,15 +19,26 @@ v2.8 變更（修正「同一段歷史、不同執行日產出不同交易明細
      每日抓到的行情存檔；超過 DATA_FREEZE_TDAYS 個交易日的舊資料一律
      以快取為準，不再被 yfinance auto_adjust 的回溯調整（除權息還原）
      或 FinMind 事後校正改寫。
-  ② 訊號分數凍結：./cache/signal_cache.csv
-     calc_dynamic() 使用 fwd20 = shift(-20)，最近 20 個交易日的動態勝率
-     樣本尚未成熟，分數會隨時間變動 → 一旦跨過 SIGNAL_MATURE_TDAYS，
-     ml/ms 即永久鎖定，避免 backtest() 狀態機被回溯改寫整段交易序列。
-  ③ Excel 新增「訊號狀態」欄，區分「已確定 / 暫定」，統計摘要分開計算。
-  ④ 所有快取邏輯均有 try/except 保護，讀寫失敗自動退回即時計算，
+  ② 訊號分數凍結：./cache/signal_cache.csv（v2.8 版本，已於 v2.9 修正邏輯）
+  ③ 所有快取邏輯均有 try/except 保護，讀寫失敗自動退回即時計算，
      不影響日報產出；首次執行（無快取）亦可正常運作。
-  ⑤ 環境變數 REBUILD_CACHE=1 可強制清空快取重建。
-  ★ generate_daily_report() 回傳值維持 (pptx_path, excel_path, state) 不變，
+  ④ 環境變數 REBUILD_CACHE=1 可強制清空快取重建。
+================================================================
+v2.9 變更（修正 v2.8「等成熟才鎖定」的邏輯錯誤）：
+  ★ 核心修正：訊號分數不再「等滿 25 個交易日才凍結」，而是「第一次被
+    算出來的當下就永久鎖定」（apply_signal_cache()）。原因：交易決策
+    一旦在當天被實際算出、實際會拿去操作，就必須永久保留，不能因為
+    之後資料補齊、模型看法改變，就回頭假裝那天做了不同的決定——
+    這才符合「依照當時實際發出的訊號記錄交易」的要求。
+  ① export_trades_excel() 移除「訊號狀態」篩選/標記，恢復顯示全部交易——
+     因為現在每一筆都是鎖定後的最終結果，不再有「暫定」這個概念。
+  ② 新增 bootstrap_signal_cache.py（獨立腳本，需另外執行一次）：
+     首次部署 v2.9 時，signal_cache.csv 是空的，若不處理，第一次
+     執行會用「今天」的完整資料回頭鎖定最近一段時間的分數，鎖到的
+     會是「事後回顧版」而非「當時真正看得到的版本」。這支腳本用
+     逐日往回截斷資料、重新計算的方式，把最近一段時間的分數還原成
+     真正的「時間點決策」版本，跑完後就不需要再執行第二次。
+  ③ generate_daily_report() 回傳值維持 (pptx_path, excel_path, state) 不變，
     run_and_send.py 無須修改。
 ================================================================
 """
@@ -108,9 +119,13 @@ CACHE_DIR    = SCRIPT_DIR / "cache"
 MARKET_CACHE = CACHE_DIR / "market_data_cache.csv"   # 行情原始資料快照
 SIGNAL_CACHE = CACHE_DIR / "signal_cache.csv"        # ml / ms 訊號分數快照
 
-# 訊號成熟門檻：calc_dynamic 的 fwd20 需要 FWD_DAYS 個交易日才算得完整，
-# 再加 5 天緩衝。低於此天數的訊號視為「暫定」，仍會隨新資料變動。
-SIGNAL_MATURE_TDAYS = FWD_DAYS + 5      # = 25
+# ★ v2.9：訊號分數不再等「成熟」才鎖定，而是第一次被算出來的當下就永久鎖定
+#   （見 apply_signal_cache()）。這個常數保留下來純粹是給 bootstrap_signal_cache.py
+#   當「回溯補建天數」的參考值：calc_dynamic 的 fwd20 需要 FWD_DAYS 個交易日
+#   才算得完整，再加上 DYN_WINDOW 個交易日的視窗，理論上受影響的範圍大約是
+#   FWD_DAYS + DYN_WINDOW ≈ 80 個交易日；這裡設寬鬆一點的參考值僅供說明，
+#   實際回溯天數由 bootstrap 腳本的參數決定，跟這裡的日常凍結邏輯無關。
+SIGNAL_MATURE_TDAYS = FWD_DAYS + DYN_WINDOW   # = 80（僅供參考，不再用於篩選）
 
 # 行情凍結門檻：最近這幾個交易日的行情允許被新抓的資料更新（處理盤後校正），
 # 更早的一律以快取為準，不再被回溯調整改寫。
@@ -204,13 +219,26 @@ def freeze_market_data(df: pd.DataFrame) -> pd.DataFrame:
 
 def apply_signal_cache(d: pd.DataFrame, ml, ms):
     """
-    ★ 訊號分數凍結。
-    calc_dynamic() 用 fwd20 = shift(-FWD_DAYS)，最近 FWD_DAYS 個交易日的
-    動態勝率樣本尚未成熟，分數會隨新資料到位而改變，導致 backtest() 的
-    部位狀態機（cur 逐日累加）整段歷史被改寫。
+    ★ v2.9 訊號分數「當下即鎖定」（不是等成熟才鎖定）。
 
-    本函式將「已成熟」日期的 ml/ms 鎖定為第一次算出來的值，之後永不重算。
-    回傳 (ml, ms)，任何失敗都回傳原值。
+    背景：calc_dynamic() 用 fwd20 = shift(-FWD_DAYS)，這代表任何一天的分數，
+    只要往回看的 60 天視窗裡有觸發樣本落在最近 ~FWD_DAYS+DYN_WINDOW 天內，
+    分數就會隨資料越補越多而改變——這是模型設計本身的特性，不是 bug，
+    永遠不會有「等到第 N 天之後就不會再變」這種乾淨的分界。
+
+    但對「這一天實際做了什麼決策」這件事來說，重點從來不是這個分數準不準、
+    成不成熟，而是「這是不是這一天第一次被算出來、當下實際會被拿去用的值」。
+    一旦某一天已經被算過（不管是今天剛算出來、還是很久以前算出來的），
+    這個值就要永久鎖住，之後任何一次重跑都不准再覆蓋——因為現實中的交易
+    決策一旦做了就是做了，不能因為之後資料變多、模型「看法改變」就回頭
+    假裝那天做了別的決定。
+
+    做法：
+      - 快取裡已經有的日期 → 一律套用快取值（無條件，不分成不成熟）。
+      - 快取裡沒有的日期（代表這是第一次被算到，通常就是「今天」）
+        → 用這次剛算出來的即時值，並立刻寫入快取、永久鎖定。
+
+    回傳 (ml, ms)，任何失敗都回傳原值（退回沒有凍結的行為，不影響日報產出）。
     """
     ml = np.asarray(ml, dtype=float).copy()
     ms = np.asarray(ms, dtype=float).copy()
@@ -232,7 +260,7 @@ def apply_signal_cache(d: pd.DataFrame, ml, ms):
         try:
             old = _read_cache_csv(SIGNAL_CACHE)
             old["date"] = pd.to_datetime(old["date"])
-            # keep="first"：先寫入的（先凍結的）永遠優先
+            # keep="first"：最早寫入的（最早鎖定的）永遠優先，之後重複一律忽略
             old = old.drop_duplicates(subset="date", keep="first")
 
             mp_ml = dates.map(old.set_index("date")["ml"]).to_numpy(dtype=float)
@@ -245,51 +273,30 @@ def apply_signal_cache(d: pd.DataFrame, ml, ms):
                 ml[hit] = mp_ml[hit]
                 ms[hit] = mp_ms[hit]
 
-            print(f"  🔒 訊號快取：沿用 {int(hit.sum())} 日已凍結分數"
+            print(f"  🔒 訊號快取：沿用 {int(hit.sum())} 日已鎖定分數"
                   f"（其中 {n_diff} 日與本次即時重算結果不同 → 已阻止歷史被改寫）")
         except Exception as e:
             print(f"  ⚠️  訊號快取讀取失敗，本次全部即時計算（{e}）")
             old = None
 
-    # 只把「已成熟」的日期寫入快取
-    n_mature = max(0, len(d) - SIGNAL_MATURE_TDAYS)
+    # ★ 把「這次剛出現、快取裡還沒有」的日期立刻寫入快取鎖定——
+    #   不再等成熟，第一次算出來的當下就是永久值。
     try:
-        fresh = pd.DataFrame({"date": dates.iloc[:n_mature].values,
-                              "ml":   ml[:n_mature],
-                              "ms":   ms[:n_mature]})
+        fresh = pd.DataFrame({"date": dates.values, "ml": ml, "ms": ms})
         if old is not None and len(old) > 0:
             combined = pd.concat([old[["date", "ml", "ms"]], fresh], ignore_index=True)
         else:
             combined = fresh
+        # keep="first"：已鎖定的日期（在 old 裡、排在前面）永遠優先於這次剛算出來的重複值
         combined = combined.drop_duplicates(subset="date", keep="first").sort_values("date")
+        n_new = len(combined) - (len(old) if old is not None else 0)
         combined.to_csv(SIGNAL_CACHE, index=False, float_format="%.17g")
         print(f"  💾 訊號快取已更新：{SIGNAL_CACHE.name}"
-              f"（已凍結 {len(combined)} 日，最近 {SIGNAL_MATURE_TDAYS} 交易日維持暫定）")
+              f"（總計鎖定 {len(combined)} 日，本次新鎖定 {n_new} 日）")
     except Exception as e:
         print(f"  ⚠️  訊號快取寫入失敗（不影響本次日報）：{e}")
 
     return ml, ms
-
-
-def build_maturity_lookup(d: pd.DataFrame):
-    """回傳一個函式 is_mature(entry_date) -> bool，判斷該訊號是否已成熟定案"""
-    try:
-        pos = {pd.Timestamp(ts).normalize(): i
-               for i, ts in enumerate(pd.to_datetime(d["date"]))}
-        idx_last = len(d) - 1
-    except Exception:
-        return lambda _dt: True
-
-    def _is_mature(entry_date):
-        try:
-            i = pos.get(pd.Timestamp(entry_date).normalize())
-            if i is None:
-                return True
-            return (idx_last - i) >= SIGNAL_MATURE_TDAYS
-        except Exception:
-            return True
-
-    return _is_mature
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1212,9 +1219,12 @@ def generate_pptx(run_date, state, stats_3yr, stats_ytd, d, chart_img, output_pa
 def export_trades_excel(d, bt, run_date, output_dir) -> Path:
     """
     將近一年的進出場明細輸出為 Excel 檔案。
-    欄位：方向、進場日期、進場點位、出場日期、出場點位、持倉天數、損益(%)、勝/負、訊號狀態
-    ★ v2.8：新增「訊號狀態」欄。進場日距今不足 SIGNAL_MATURE_TDAYS 個交易日者
-      標為「暫定」（動態勝率樣本未成熟，之後仍可能變動），統計摘要分開計算。
+    欄位：方向、進場日期、進場點位、出場日期、出場點位、持倉天數、損益(%)、勝/負
+
+    ★ v2.9：不再對交易做「成熟/暫定」篩選或標記——因為 apply_signal_cache()
+      已經確保每一天的 ml/ms 分數在第一次被算出來的當下就永久鎖定，
+      這裡看到的每一筆交易，就是「那一天實際被算出來、實際會拿去操作」
+      的決策結果，本來就不會再變動，不需要也不應該過濾掉任何一筆。
     """
     try:
         import openpyxl
@@ -1228,14 +1238,11 @@ def export_trades_excel(d, bt, run_date, output_dir) -> Path:
     cutoff = d["date"].iloc[-1] - pd.Timedelta(days=365)
     trades_1y = [t for t in bt["trades"] if t["entry_date"] >= cutoff]
 
-    is_mature = build_maturity_lookup(d)   # ★ v2.8
-
     # ── 整理成 DataFrame ──────────────────────────────────────
     rows = []
     for t in trades_1y:
         is_open  = "exit_date" not in t
         dir_str  = "多單" if t["dir_code"] == 1 else "空單"
-        mature   = is_mature(t["entry_date"])
         rows.append({
             "方向":       dir_str,
             "進場日期":   t["entry_date"].strftime("%Y/%m/%d"),
@@ -1245,8 +1252,6 @@ def export_trades_excel(d, bt, run_date, output_dir) -> Path:
             "持倉天數":   t["n_days"]                         if not is_open else "-",
             "損益(%)":    round(t["pct_return"], 2)            if not is_open else "-",
             "結果":       ("獲利 ✅" if t["is_win"] else "虧損 ❌") if not is_open else "持倉中 🔄",
-            "訊號狀態":   "已確定" if mature else "暫定 ⚠",
-            "_mature":    mature,
         })
 
     wb = openpyxl.Workbook()
@@ -1255,7 +1260,7 @@ def export_trades_excel(d, bt, run_date, output_dir) -> Path:
 
     # ── 標題列 ───────────────────────────────────────────────
     title = f"台指策略日報 — 近一年進出場明細（截至 {run_date.strftime('%Y/%m/%d')}）"
-    ws.merge_cells("A1:I1")
+    ws.merge_cells("A1:H1")
     ws["A1"] = title
     ws["A1"].font      = Font(name="微軟正黑體", size=14, bold=True, color="FFFFFF")
     ws["A1"].fill      = PatternFill("solid", fgColor="1E3A5F")
@@ -1264,7 +1269,7 @@ def export_trades_excel(d, bt, run_date, output_dir) -> Path:
 
     # ── 欄位標題 ─────────────────────────────────────────────
     headers = ["方向", "進場日期", "進場點位", "出場日期", "出場點位",
-               "持倉天數", "損益(%)", "結果", "訊號狀態"]
+               "持倉天數", "損益(%)", "結果"]
     thin    = Side(style="thin", color="D1D5DB")
     border  = Border(left=thin, right=thin, top=thin, bottom=thin)
     for col_idx, h in enumerate(headers, start=1):
@@ -1282,8 +1287,6 @@ def export_trades_excel(d, bt, run_date, output_dir) -> Path:
     font_win   = Font(name="微軟正黑體", size=11, color="DC2626", bold=True)
     font_lose  = Font(name="微軟正黑體", size=11, color="16A34A", bold=True)
     font_base  = Font(name="微軟正黑體", size=11)
-    font_prov  = Font(name="微軟正黑體", size=11, color="B45309", bold=True)  # 琥珀色（暫定）
-    font_conf  = Font(name="微軟正黑體", size=11, color="475569")             # 灰藍（已確定）
 
     for row_idx, row in enumerate(rows, start=3):
         is_holding = (row["出場日期"] == "持倉中")
@@ -1296,84 +1299,46 @@ def export_trades_excel(d, bt, run_date, output_dir) -> Path:
             cell.fill      = bg_fill
             cell.border    = border
             cell.alignment = Alignment(horizontal="center", vertical="center")
-            # 損益欄位特別標色
             if key == "損益(%)" and isinstance(pnl, float):
                 cell.font = font_win if pnl >= 0 else font_lose
             elif key == "結果":
                 if "獲利" in str(row[key]):  cell.font = font_win
                 elif "虧損" in str(row[key]): cell.font = font_lose
                 else: cell.font = font_base
-            elif key == "訊號狀態":
-                cell.font = font_conf if row["_mature"] else font_prov
             else:
                 cell.font = font_base
         ws.row_dimensions[row_idx].height = 20
 
     # ── 統計摘要列 ───────────────────────────────────────────
-    def _stats_of(subset):
-        n_total  = len(subset)
-        n_win    = sum(1 for r in subset if "獲利" in str(r["結果"]))
-        n_long   = sum(1 for r in subset if r["方向"] == "多單")
-        n_short  = sum(1 for r in subset if r["方向"] == "空單")
-        w_long   = sum(1 for r in subset if r["方向"] == "多單" and "獲利" in str(r["結果"]))
-        w_short  = sum(1 for r in subset if r["方向"] == "空單" and "獲利" in str(r["結果"]))
-        return {
-            "n": n_total,
-            "wr_all":   n_win  / n_total * 100 if n_total else 0,
-            "wr_long":  w_long / n_long  * 100 if n_long  else 0,
-            "wr_short": w_short/ n_short * 100 if n_short else 0,
-            "n_long": n_long, "n_short": n_short,
-            "pnl": sum(r["損益(%)"] for r in subset if isinstance(r["損益(%)"], float)),
-        }
-
     done_trades = [r for r in rows if r["出場日期"] != "持倉中"]
-    confirmed   = [r for r in done_trades if r["_mature"]]
-    provisional = [r for r in done_trades if not r["_mature"]]
+    n_total  = len(done_trades)
+    n_win    = sum(1 for r in done_trades if "獲利" in str(r["結果"]))
+    n_long   = sum(1 for r in done_trades if r["方向"] == "多單")
+    n_short  = sum(1 for r in done_trades if r["方向"] == "空單")
+    w_long   = sum(1 for r in done_trades if r["方向"] == "多單" and "獲利" in str(r["結果"]))
+    w_short  = sum(1 for r in done_trades if r["方向"] == "空單" and "獲利" in str(r["結果"]))
+    wr_all   = n_win   / n_total  * 100 if n_total  else 0
+    wr_long  = w_long  / n_long   * 100 if n_long   else 0
+    wr_short = w_short / n_short  * 100 if n_short  else 0
+    total_pnl = sum(r["損益(%)"] for r in done_trades if isinstance(r["損益(%)"], float))
 
     ws.append([])
-    sc = _stats_of(confirmed)
-    row_c = ws.max_row + 1
-    ws.merge_cells(f"A{row_c}:I{row_c}")
-    ws[f"A{row_c}"] = ("　".join([
-        f"【已確定】統計摘要（已出場 {sc['n']} 筆）",
-        f"整體勝率：{sc['wr_all']:.1f}%",
-        f"多單勝率：{sc['wr_long']:.1f}%（{sc['n_long']} 筆）",
-        f"空單勝率：{sc['wr_short']:.1f}%（{sc['n_short']} 筆）",
-        f"累積損益：{sc['pnl']:+.2f}%",
+    summary_row = ws.max_row + 1
+    ws.merge_cells(f"A{summary_row}:H{summary_row}")
+    ws[f"A{summary_row}"] = ("　".join([
+        f"統計摘要（已出場 {n_total} 筆）",
+        f"整體勝率：{wr_all:.1f}%",
+        f"多單勝率：{wr_long:.1f}%（{n_long} 筆）",
+        f"空單勝率：{wr_short:.1f}%（{n_short} 筆）",
+        f"累積損益：{total_pnl:+.2f}%",
     ]))
-    ws[f"A{row_c}"].font      = Font(name="微軟正黑體", size=11, bold=True, color="1E3A5F")
-    ws[f"A{row_c}"].fill      = PatternFill("solid", fgColor="E0F2FE")
-    ws[f"A{row_c}"].alignment = Alignment(horizontal="left", vertical="center")
-    ws.row_dimensions[row_c].height = 24
-
-    if provisional:
-        sp = _stats_of(provisional)
-        row_p = ws.max_row + 1
-        ws.merge_cells(f"A{row_p}:I{row_p}")
-        ws[f"A{row_p}"] = ("　".join([
-            f"【暫定】統計摘要（已出場 {sp['n']} 筆）",
-            f"整體勝率：{sp['wr_all']:.1f}%",
-            f"累積損益：{sp['pnl']:+.2f}%",
-        ]))
-        ws[f"A{row_p}"].font      = Font(name="微軟正黑體", size=11, bold=True, color="B45309")
-        ws[f"A{row_p}"].fill      = PatternFill("solid", fgColor="FEF3C7")
-        ws[f"A{row_p}"].alignment = Alignment(horizontal="left", vertical="center")
-        ws.row_dimensions[row_p].height = 24
-
-    # ── 說明列 ───────────────────────────────────────────────
-    row_note = ws.max_row + 1
-    ws.merge_cells(f"A{row_note}:I{row_note}")
-    ws[f"A{row_note}"] = (
-        f"註：動態勝率因子需 {FWD_DAYS} 個交易日的前瞻報酬才能算完整，"
-        f"故進場日距最新資料日不足 {SIGNAL_MATURE_TDAYS} 個交易日者標示為「暫定」，"
-        f"其進出場點位與損益在後續日報中仍可能調整；「已確定」之交易已永久鎖定，不再變動。"
-    )
-    ws[f"A{row_note}"].font      = Font(name="微軟正黑體", size=9, color="64748B")
-    ws[f"A{row_note}"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    ws.row_dimensions[row_note].height = 30
+    ws[f"A{summary_row}"].font      = Font(name="微軟正黑體", size=11, bold=True, color="1E3A5F")
+    ws[f"A{summary_row}"].fill      = PatternFill("solid", fgColor="E0F2FE")
+    ws[f"A{summary_row}"].alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[summary_row].height = 24
 
     # ── 欄寬調整 ─────────────────────────────────────────────
-    col_widths = [10, 14, 14, 14, 14, 12, 12, 14, 14]
+    col_widths = [10, 14, 14, 14, 14, 12, 12, 14]
     for i, w in enumerate(col_widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -1384,17 +1349,15 @@ def export_trades_excel(d, bt, run_date, output_dir) -> Path:
     excel_fname = f"台指策略進出場明細_{run_date.strftime('%Y.%m.%d')}.xlsx"
     excel_path  = output_dir / excel_fname
     wb.save(str(excel_path))
-    print(f"  ✅  進出場明細已產出：{excel_path}"
-          f"（共 {len(rows)} 筆；已確定 {len(confirmed)} / 暫定 {len(provisional)}）")
+    print(f"  ✅  進出場明細已產出：{excel_path}（共 {len(rows)} 筆）")
     return excel_path
-
 
 
 def generate_daily_report():
     # ★ 使用台灣時間取得日期
     run_date = datetime.now(TW_TZ).date()
     print("="*60)
-    print(f"  台指策略日報  v15 多因子量化模型  v2.8")
+    print(f"  台指策略日報  v15 多因子量化模型  v2.9")
     print(f"  執行日期：{run_date}  ({datetime.now(TW_TZ).strftime('%H:%M:%S')} 台灣時間)")
     print("="*60)
 
@@ -1417,7 +1380,7 @@ def generate_daily_report():
 
     d=build_factors(df,fi)
     ml,ms,gL,gS=compute_scores(d)
-    # ★ v2.8：訊號分數凍結（防 fwd20 樣本成熟後回頭改寫歷史交易序列）
+    # ★ v2.8：訊號分數鎖定（第一次算出來的當下即永久鎖定，見 v2.9 說明）
     ml,ms=apply_signal_cache(d,ml,ms)
 
     bt=backtest(d,ml,ms,gL,gS)
