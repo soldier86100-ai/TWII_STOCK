@@ -41,6 +41,13 @@ v2.9 變更（修正 v2.8「等成熟才鎖定」的邏輯錯誤）：
   ③ generate_daily_report() 回傳值維持 (pptx_path, excel_path, state) 不變，
     run_and_send.py 無須修改。
 ================================================================
+v2.10 變更（修正「昨天喊空單續抱、今天卻顯示空手觀望」漏掉出場指令）：
+  ① determine_state() 的「昨天部位」改用 ./cache/state_cache.csv 裡
+     昨天日報實際發出的部位，不再用今天重跑回測得到的 pos[i-1]。
+     兩者不一致時終端機會印出「⚠️ 歷史部位被改寫」。
+  ② apply_signal_cache() 除 ml/ms 外，門票 gL/gS 也一併鎖定
+     （出場條件 esig 會用到 gS/gL，v2.9 沒鎖，是歷史被改寫的主因之一）。
+================================================================
 """
 
 import os, sys, warnings
@@ -117,7 +124,10 @@ FWD_DAYS        = 20
 # ── ★ v2.8 快照凍結設定 ────────────────────────────────────────
 CACHE_DIR    = SCRIPT_DIR / "cache"
 MARKET_CACHE = CACHE_DIR / "market_data_cache.csv"   # 行情原始資料快照
-SIGNAL_CACHE = CACHE_DIR / "signal_cache.csv"        # ml / ms 訊號分數快照
+SIGNAL_CACHE = CACHE_DIR / "signal_cache.csv"        # ml / ms / gL / gS 訊號快照
+# ★ v2.10：每天「實際發出」的部位與建議，隔天用它當作「昨天的部位」，
+#   不再拿今天重跑回測得到的（可能已被改寫的）昨天部位來比較。
+STATE_CACHE  = CACHE_DIR / "state_cache.csv"
 
 # ★ v2.9：訊號分數不再等「成熟」才鎖定，而是第一次被算出來的當下就永久鎖定
 #   （見 apply_signal_cache()）。這個常數保留下來純粹是給 bootstrap_signal_cache.py
@@ -144,6 +154,7 @@ def reset_cache_if_requested():
     """環境變數 REBUILD_CACHE=1 時清空快取（用於策略邏輯變更後重建）"""
     if os.environ.get("REBUILD_CACHE", "").strip() not in ("1", "true", "True", "yes"):
         return
+    # state_cache.csv 是「實際發出過的建議」紀錄，不隨重建刪除
     for p in (MARKET_CACHE, SIGNAL_CACHE):
         try:
             if p.exists():
@@ -217,7 +228,7 @@ def freeze_market_data(df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def apply_signal_cache(d: pd.DataFrame, ml, ms):
+def apply_signal_cache(d: pd.DataFrame, ml, ms, gL=None, gS=None):
     """
     ★ v2.9 訊號分數「當下即鎖定」（不是等成熟才鎖定）。
 
@@ -242,18 +253,23 @@ def apply_signal_cache(d: pd.DataFrame, ml, ms):
     """
     ml = np.asarray(ml, dtype=float).copy()
     ms = np.asarray(ms, dtype=float).copy()
+    # ★ v2.10：門票 gL/gS 也一起鎖定。v2.9 只鎖 ml/ms，但出場條件
+    #   esig = ms<SX or not gS ... 用的 gS 每天重算，最近幾天的資料
+    #   （YF 台股標的延遲、ADR/外資補值）一修正，昨天的出場判斷就會被改寫。
+    gL = (np.zeros(len(ml), dtype=bool) if gL is None else np.asarray(gL, dtype=bool).copy())
+    gS = (np.zeros(len(ms), dtype=bool) if gS is None else np.asarray(gS, dtype=bool).copy())
 
     try:
         dates = pd.to_datetime(d["date"]).reset_index(drop=True)
     except Exception as e:
         print(f"  ⚠️  訊號快取：日期欄讀取失敗，略過凍結（{e}）")
-        return ml, ms
+        return ml, ms, gL, gS
 
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         print(f"  ⚠️  無法建立快取目錄，略過訊號凍結（{e}）")
-        return ml, ms
+        return ml, ms, gL, gS
 
     old = None
     if SIGNAL_CACHE.exists():
@@ -275,19 +291,33 @@ def apply_signal_cache(d: pd.DataFrame, ml, ms):
 
             print(f"  🔒 訊號快取：沿用 {int(hit.sum())} 日已鎖定分數"
                   f"（其中 {n_diff} 日與本次即時重算結果不同 → 已阻止歷史被改寫）")
+
+            # ★ v2.10：gL/gS 鎖定（舊版快取沒有這兩欄 → 該日沿用本次重算值）
+            if "gL" in old.columns and "gS" in old.columns:
+                mp_gL = dates.map(old.set_index("date")["gL"]).to_numpy(dtype=float)
+                mp_gS = dates.map(old.set_index("date")["gS"]).to_numpy(dtype=float)
+                hg = (~np.isnan(mp_gL)) & (~np.isnan(mp_gS))
+                g_diff = int(((mp_gL[hg] > 0.5) != gL[hg]).sum() + ((mp_gS[hg] > 0.5) != gS[hg]).sum())
+                gL[hg] = mp_gL[hg] > 0.5
+                gS[hg] = mp_gS[hg] > 0.5
+                print(f"  🔒 門票快取：沿用 {int(hg.sum())} 日已鎖定 gL/gS"
+                      f"（其中 {g_diff} 個值與本次重算不同 → 已阻止歷史被改寫）")
         except Exception as e:
             print(f"  ⚠️  訊號快取讀取失敗，本次全部即時計算（{e}）")
             old = None
 
-    # ★ 把「這次剛出現、快取裡還沒有」的日期立刻寫入快取鎖定——
-    #   不再等成熟，第一次算出來的當下就是永久值。
+    # ★ 把「這次剛出現、快取裡還沒有」的日期／欄位立刻寫入快取鎖定。
     try:
-        fresh = pd.DataFrame({"date": dates.values, "ml": ml, "ms": ms})
+        fresh = pd.DataFrame({"date": dates.values, "ml": ml, "ms": ms,
+                              "gL": gL.astype(float), "gS": gS.astype(float)})
         if old is not None and len(old) > 0:
-            combined = pd.concat([old[["date", "ml", "ms"]], fresh], ignore_index=True)
+            # combine_first：已鎖定的值優先；舊快取缺的日期或 gL/gS 欄才用本次值補上
+            combined = (old.set_index("date")
+                           .combine_first(fresh.set_index("date"))
+                           .reset_index())
+            combined = combined[["date", "ml", "ms", "gL", "gS"]]
         else:
             combined = fresh
-        # keep="first"：已鎖定的日期（在 old 裡、排在前面）永遠優先於這次剛算出來的重複值
         combined = combined.drop_duplicates(subset="date", keep="first").sort_values("date")
         n_new = len(combined) - (len(old) if old is not None else 0)
         combined.to_csv(SIGNAL_CACHE, index=False, float_format="%.17g")
@@ -296,7 +326,7 @@ def apply_signal_cache(d: pd.DataFrame, ml, ms):
     except Exception as e:
         print(f"  ⚠️  訊號快取寫入失敗（不影響本次日報）：{e}")
 
-    return ml, ms
+    return ml, ms, gL, gS
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -648,8 +678,51 @@ def backtest(d, ml, ms, gL, gS):
 # ═══════════════════════════════════════════════════════════════
 # 3. 狀態判斷
 # ═══════════════════════════════════════════════════════════════
+def _load_issued_pos(before_date):
+    """讀取 before_date 之前最後一次「實際發出」的部位（找不到回傳 None）"""
+    try:
+        if not STATE_CACHE.exists():
+            return None
+        s = _read_cache_csv(STATE_CACHE)
+        s["date"] = pd.to_datetime(s["date"])
+        s = s[s["date"] < pd.Timestamp(before_date)].sort_values("date")
+        if s.empty:
+            return None
+        return int(s.iloc[-1]["pos"]), s.iloc[-1]["date"].date()
+    except Exception as e:
+        print(f"  ⚠️  部位快取讀取失敗，改用回測重算的昨日部位（{e}）")
+        return None
+
+
+def _save_issued_state(last_date, pos, rec):
+    """記錄今天實際發出的部位與建議；同一資料日已有紀錄則保留最早那筆"""
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        new = pd.DataFrame({"date": [pd.Timestamp(last_date)], "pos": [int(pos)],
+                            "recommendation": [rec]})
+        if STATE_CACHE.exists():
+            old = _read_cache_csv(STATE_CACHE)
+            old["date"] = pd.to_datetime(old["date"])
+            new = pd.concat([old, new], ignore_index=True)
+        new = new.drop_duplicates(subset="date", keep="first").sort_values("date")
+        new.to_csv(STATE_CACHE, index=False)
+    except Exception as e:
+        print(f"  ⚠️  部位快取寫入失敗（不影響本次日報）：{e}")
+
+
 def determine_state(d, bt, ml, ms, gL, gS):
     i=len(d)-1; pt=int(bt["pos"][i]); py=int(bt["pos"][i-1]) if i>=1 else 0
+    # ★ v2.10：「昨天的部位」以昨天日報實際發出的為準。
+    #   v2.9 用今天重跑回測得到的 pos[i-1]，一旦歷史被改寫（例如空單在
+    #   回測裡被提前一天平倉），昨天實際喊「空單續抱」、今天卻顯示「空手觀望」，
+    #   等於漏掉一次出場指令。
+    issued = _load_issued_pos(d["date"].iloc[i])
+    if issued is not None:
+        py_issued, issued_date = issued
+        if py_issued != py:
+            print(f"  ⚠️  歷史部位被改寫：{issued_date} 日報實際發出部位 {py_issued:+d}，"
+                  f"今日回測重算為 {py:+d} → 以實際發出的部位為準")
+        py = py_issued
     rec={( 1, 1):"多單續抱",( 1, 0):"多單建倉",( 1,-1):"空單轉多",
          ( 0, 1):"多單出場",( 0, 0):"空手觀望",( 0,-1):"空單出場",
          (-1, 1):"多單轉空",(-1, 0):"空單建倉",(-1,-1):"空單續抱",
@@ -657,6 +730,7 @@ def determine_state(d, bt, ml, ms, gL, gS):
     if   rec in ("多單續抱","多單建倉","空單轉多"): bias="偏多"
     elif rec in ("空單續抱","空單建倉","多單轉空"): bias="偏空"
     else:                                            bias="震盪"
+    _save_issued_state(d["date"].iloc[i], pt, rec)
     return {"recommendation":rec,"bias":bias,
             "ml":float(ml[i]),"ms":float(ms[i]),
             "gL":bool(gL[i]),"gS":bool(gS[i]),
@@ -1381,7 +1455,7 @@ def generate_daily_report():
     d=build_factors(df,fi)
     ml,ms,gL,gS=compute_scores(d)
     # ★ v2.8：訊號分數鎖定（第一次算出來的當下即永久鎖定，見 v2.9 說明）
-    ml,ms=apply_signal_cache(d,ml,ms)
+    ml,ms,gL,gS=apply_signal_cache(d,ml,ms,gL,gS)   # ★ v2.10：gL/gS 一併鎖定
 
     bt=backtest(d,ml,ms,gL,gS)
     state=determine_state(d,bt,ml,ms,gL,gS)
